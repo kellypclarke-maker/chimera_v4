@@ -176,7 +176,20 @@ async def ws_collect_ticker_snapshot(
     use_private_auth: bool = False,
     timeout_s: float = 15.0,
 ) -> Dict[str, Dict[str, Any]]:
-    want = {str(t).strip().upper() for t in market_tickers if str(t).strip()}
+    raw_want = {str(t).strip().upper() for t in market_tickers if str(t).strip()}
+    want: set[str] = set()
+    dropped_parent_events: List[str] = []
+    for t in sorted(raw_want):
+        is_parent_sports_event = (t.startswith("KXNBAGAME-") or t.startswith("KXNHLGAME-")) and t.count("-") == 1
+        if is_parent_sports_event:
+            dropped_parent_events.append(t)
+            continue
+        want.add(t)
+    if dropped_parent_events:
+        print(
+            f"[KALSHI_WS] dropping parent sports event tickers from subscribe set "
+            f"count={len(dropped_parent_events)} tickers={dropped_parent_events[:5]}"
+        )
     if not want:
         return {}
     client = KalshiWsClient(ws_url=ws_url, use_private_auth=use_private_auth)

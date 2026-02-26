@@ -1692,7 +1692,8 @@ def _fetch_market(*, session: requests.Session, base_url: str, ticker: str) -> D
                 out["yes_bid_size"] = int(float(fp) * 100.0)
         return out
 
-    resp = session.get(f"{base_url}/markets/{ticker}", timeout=30.0)
+    market_url = f"{str(base_url).rstrip('/')}/markets/{ticker}"
+    resp = session.get(market_url, timeout=30.0)
     resp.raise_for_status()
     data = resp.json()
     if not isinstance(data, dict):
@@ -2970,6 +2971,7 @@ def main() -> int:
                 else:
                     print("[SHADOW][DISCOVERY] rediscovery found 0 candidates")
 
+        explicit_override_tickers = {str(t).strip().upper() for t in tickers_override if str(t).strip()}
         parent_sports_event_tickers = sorted(
             {
                 str(o.get("ticker") or "").strip().upper()
@@ -2989,6 +2991,39 @@ def main() -> int:
                     )
                     if expanded_markets:
                         parent_sports_event_markets[parent_event_ticker] = expanded_markets
+
+        ghost_purged = 0
+        ghost_tickers: set[str] = set()
+        ghost_now_iso = _utc_now_iso()
+        for o in orders:
+            status = str(o.get("status") or "").strip().lower()
+            if status not in {"open", "filled"}:
+                continue
+            ticker = str(o.get("ticker") or "").strip().upper()
+            if not _is_parent_sports_event_ticker(ticker):
+                continue
+            if ticker in explicit_override_tickers:
+                # Explicitly declared parent events may be kept for later expansion attempts.
+                continue
+            if ticker in parent_sports_event_markets:
+                continue
+            _close_order_unfilled(
+                o,
+                reason="ghost_parent_event_ticker_unresolved",
+                now_iso=ghost_now_iso,
+                audit_note=f"ticker={ticker}",
+            )
+            ghost_purged += 1
+            ghost_tickers.add(ticker)
+        if ghost_purged > 0:
+            ticker_state = state.get("tickers")
+            if isinstance(ticker_state, dict):
+                for t in sorted(ghost_tickers):
+                    ticker_state.pop(t, None)
+            print(
+                f"[SHADOW][DISCOVERY] purged unresolved parent event ghost orders={ghost_purged} "
+                f"tickers={sorted(ghost_tickers)}"
+            )
 
         open_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
         needed_market_tickers: set[str] = set()
@@ -3010,6 +3045,8 @@ def main() -> int:
 
             prev_runtime_ticker = str(o.get("_runtime_market_ticker") or "").strip().upper()
             o["_runtime_market_ticker"] = runtime_ticker
+            if runtime_ticker.startswith("KXNBAGAME") or runtime_ticker.startswith("KXNHLGAME"):
+                o["category"] = "Sports"
             if runtime_ticker and prev_runtime_ticker != runtime_ticker:
                 print(f"[SHADOW][DISCOVERY] order ticker remap order={ticker} runtime_market={runtime_ticker}")
             if not runtime_ticker:
