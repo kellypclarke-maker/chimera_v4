@@ -1504,6 +1504,106 @@ def _initialize_or_update_state(
     return state
 
 
+def _override_matches_ticker(*, ticker: str, overrides: Sequence[str]) -> bool:
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return False
+    for raw in overrides:
+        token = str(raw or "").strip().upper()
+        if not token:
+            continue
+        if t == token or t.startswith(token) or token in t:
+            return True
+    return False
+
+
+def _reopen_stale_closed_override_orders(
+    *,
+    state: Dict[str, Any],
+    candidates: Sequence[Dict[str, str]],
+    tickers_override: Sequence[str],
+    day: str,
+    size_contracts: int,
+    execution_mode: str,
+) -> int:
+    if not tickers_override:
+        return 0
+    orders_in = state.get("orders")
+    if not isinstance(orders_in, list) or not orders_in:
+        return 0
+
+    candidate_by_ticker: Dict[str, Dict[str, str]] = {}
+    for row in candidates:
+        if not isinstance(row, dict):
+            continue
+        t = str(row.get("ticker") or "").strip().upper()
+        if t:
+            candidate_by_ticker[t] = row
+
+    reopened = 0
+    reopened_tickers: List[str] = []
+    now_iso = _utc_now_iso()
+    for idx, order in enumerate(orders_in):
+        if not isinstance(order, dict):
+            continue
+        status = str(order.get("status") or "").strip().lower()
+        if status != "closed_unfilled":
+            continue
+        ticker = str(order.get("ticker") or "").strip().upper()
+        if not ticker or not _override_matches_ticker(ticker=ticker, overrides=tickers_override):
+            continue
+
+        row = candidate_by_ticker.get(ticker)
+        if row is None:
+            category = str(order.get("category") or "").strip() or ("Sports" if _is_sports_ticker(ticker) else "")
+            row = {
+                "strategy_id": str(order.get("strategy_id") or ""),
+                "ticker": ticker,
+                "event_ticker": str(order.get("event_ticker") or ticker.rsplit("-", 1)[0]),
+                "title": str(order.get("title") or ""),
+                "category": category,
+                "close_time": str(order.get("close_time") or ""),
+                "action": "post_yes",
+                "maker_or_taker": ("taker" if str(execution_mode).strip().lower() == "taker" else "maker"),
+                "yes_price_cents": str(order.get("intended_price_cents") or "50"),
+                "yes_bid": str(order.get("yes_bid") or ""),
+                "yes_ask": str(order.get("yes_ask") or ""),
+                "no_bid": str(order.get("no_bid") or ""),
+                "no_ask": str(order.get("no_ask") or ""),
+                "ev_dollars": str(order.get("_runtime_last_ev") or ""),
+                "fees_assumed_dollars": str(order.get("fees_assumed_dollars") or "0.0"),
+                "slippage_assumed_dollars": str(order.get("slippage_assumed_dollars") or "0.0"),
+                "rules_text_hash": str(order.get("rules_text_hash") or ""),
+                "rules_pointer": str(order.get("rules_pointer") or ""),
+                "resolution_pointer": str(order.get("resolution_pointer") or ""),
+                "liquidity_notes": "source=stale_closed_override_reopen",
+                "p_true": str(order.get("_runtime_last_p_true") or ""),
+                "data_as_of_ts": now_iso,
+                "market_url": "",
+            }
+
+        refreshed = _build_order_from_candidate(
+            row=row,
+            day=day,
+            size_contracts=size_contracts,
+            execution_mode=execution_mode,
+        )
+        refreshed["_runtime_market_ticker"] = ticker
+        refreshed["notes"] = _append_note(str(refreshed.get("notes") or ""), "reopened_from_closed_override")
+        orders_in[idx] = refreshed
+        reopened += 1
+        reopened_tickers.append(ticker)
+
+    if reopened > 0:
+        state["orders"] = orders_in
+        state["updated_ts"] = _utc_now_iso()
+        print(
+            f"[SHADOW][DISCOVERY] reopened stale closed override orders={reopened} "
+            f"tickers={sorted(reopened_tickers)}"
+        )
+    return reopened
+
+
 def _project_canonical_rows(orders: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for o in orders:
@@ -2991,6 +3091,14 @@ def main() -> int:
         size_contracts=int(args.size_contracts),
         execution_mode=execution_mode,
     )
+    _reopen_stale_closed_override_orders(
+        state=state,
+        candidates=candidates,
+        tickers_override=tickers_override,
+        day=day_key,
+        size_contracts=int(args.size_contracts),
+        execution_mode=execution_mode,
+    )
     if bool(args.force_size_contracts):
         for o in state.get("orders") or []:
             if not isinstance(o, dict):
@@ -3113,7 +3221,7 @@ def main() -> int:
             if _is_parent_sports_event_ticker(ticker):
                 expanded = parent_sports_event_markets.get(ticker, [])
                 runtime_ticker = (expanded[0] if expanded else "")
-                if not runtime_ticker:
+                if (not runtime_ticker) and status in {"open", "filled"}:
                     print(f"[SHADOW][DISCOVERY] unresolved parent event ticker={ticker} (no child market ticker)")
 
             prev_runtime_ticker = str(o.get("_runtime_market_ticker") or "").strip().upper()
