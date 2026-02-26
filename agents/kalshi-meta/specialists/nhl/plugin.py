@@ -106,6 +106,12 @@ _ODDS_MIN_POLL_SECONDS = 600.0  # Free-tier guard: no faster than every 10 minut
 _ODDS_CACHE_LAST_FETCH_MONO = 0.0
 _ODDS_CACHE_PAIR_PROBS: Dict[FrozenSet[str], Dict[str, float]] = {}
 _ODDS_CACHE_LOGGED_KEY_STATE = False
+_ODDS_CACHE_LAST_ERROR_WAS_401 = False
+
+_NHL_TEAM_NAME_TO_CODE: Dict[str, str] = {v: k for k, v in _NHL_TEAM_CODE_TO_NAME.items()}
+_NHL_MANUAL_401_PROBS: Dict[FrozenSet[str], Dict[str, float]] = {
+    frozenset({"PHI", "NYR"}): {"NYR": 0.558, "PHI": 0.488},
+}
 
 
 def _normalize_team_name(name: str) -> str:
@@ -187,7 +193,7 @@ def _extract_bookmaker_h2h_probs(bookmaker: Dict[str, object]) -> Optional[Dict[
 
 
 def _refresh_odds_pair_probabilities(config: Dict[str, object]) -> Dict[FrozenSet[str], Dict[str, float]]:
-    global _ODDS_CACHE_LAST_FETCH_MONO, _ODDS_CACHE_PAIR_PROBS, _ODDS_CACHE_LOGGED_KEY_STATE
+    global _ODDS_CACHE_LAST_FETCH_MONO, _ODDS_CACHE_PAIR_PROBS, _ODDS_CACHE_LOGGED_KEY_STATE, _ODDS_CACHE_LAST_ERROR_WAS_401
 
     api_key = _odds_api_key(config)
     if not _ODDS_CACHE_LOGGED_KEY_STATE:
@@ -211,12 +217,17 @@ def _refresh_odds_pair_probabilities(config: Dict[str, object]) -> Dict[FrozenSe
     }
     try:
         resp = requests.get(url, params=params, timeout=20.0)
+        if int(resp.status_code) == 401:
+            _ODDS_CACHE_LAST_ERROR_WAS_401 = True
+            print("[SHADOW][ORACLE] WARNING: Using Manual Hardcoded Probs due to 401 Error.")
+            return dict(_ODDS_CACHE_PAIR_PROBS)
         resp.raise_for_status()
         payload = resp.json() if resp.content else []
     except Exception as exc:
         print(f"[SHADOW][ORACLE] NHL Odds API fetch failed: {exc}")
         return dict(_ODDS_CACHE_PAIR_PROBS)
 
+    _ODDS_CACHE_LAST_ERROR_WAS_401 = False
     if not isinstance(payload, list):
         print("[SHADOW][ORACLE] NHL Odds API payload invalid (expected list)")
         return dict(_ODDS_CACHE_PAIR_PROBS)
@@ -274,15 +285,22 @@ def lookup_nhl_live_p_true(
     if not team_a or not team_b:
         return None
 
+    selected_team_code = str(side_code or "").strip().upper() or None
     selected_team = _NHL_TEAM_CODE_TO_NAME.get(str(side_code or "").strip().upper())
     if not selected_team:
         title_norm = _normalize_team_name(title)
         if title_norm in {team_a, team_b}:
             selected_team = title_norm
+            selected_team_code = _NHL_TEAM_NAME_TO_CODE.get(title_norm)
     if not selected_team:
         return None
 
     pair_probs = _refresh_odds_pair_probabilities(config)
+    if _ODDS_CACHE_LAST_ERROR_WAS_401:
+        manual = _NHL_MANUAL_401_PROBS.get(frozenset({team_a_code, team_b_code}), {})
+        if selected_team_code and selected_team_code in manual:
+            print("[SHADOW][ORACLE] WARNING: Using Manual Hardcoded Probs due to 401 Error.")
+            return float(manual[selected_team_code])
     game_probs = pair_probs.get(frozenset({team_a, team_b}))
     if not game_probs:
         return None
