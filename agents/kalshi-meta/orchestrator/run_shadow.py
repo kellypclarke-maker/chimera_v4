@@ -7,6 +7,7 @@ import csv
 import re
 import datetime as dt
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -572,6 +573,42 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
 def _load_config(path: Path) -> Dict[str, Any]:
     cfg = _read_json(path)
     return cfg if isinstance(cfg, dict) else {}
+
+
+def _load_env_list_defaults(path: Path) -> None:
+    if not path.exists():
+        return
+    loaded = 0
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = str(raw or "").strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        key = str(k or "").strip()
+        if not key:
+            continue
+        value = str(v or "").strip().strip('"').strip("'")
+        if key not in os.environ or not str(os.environ.get(key) or "").strip():
+            os.environ[key] = value
+            loaded += 1
+    print(f"[DEBUG] Env defaults loaded from {path} keys={loaded}")
+
+
+def _as_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    s = str(value).strip().lower()
+    if not s:
+        return bool(default)
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
 
 
 def _normalize_ev_thresholds_for_shadow_test(config: Dict[str, Any]) -> None:
@@ -2573,6 +2610,7 @@ def main() -> int:
     parser.add_argument("--summary-path", default="", help="Optional summary markdown output path.")
     args = parser.parse_args()
     print(f"[DEBUG] Entry point reached. Target Date: {args.date}")
+    _load_env_list_defaults(REPO_ROOT / "env.list")
 
     day = str(args.date).strip() or _utc_now().date().isoformat()
     tag = re.sub(r"[^A-Za-z0-9_-]+", "-", str(args.tag or "").strip()).strip("-")
@@ -2753,9 +2791,22 @@ def main() -> int:
                 f"open_sports_tickers={len(ws_sports_tickers)}"
             )
             if sports_ws_enabled and ws_sports_tickers:
+                key_id_present = bool(str(os.environ.get("KALSHI_API_KEY_ID") or "").strip())
+                private_key_present = bool(
+                    str(os.environ.get("KALSHI_API_PRIVATE_KEY") or "").strip()
+                    or str(os.environ.get("KALSHI_PRIVATE_KEY_PATH") or "").strip()
+                )
+                use_private_auth = _as_bool(cfg.get("sports_ws_use_private_auth"), default=False)
+                if not use_private_auth and key_id_present and private_key_present:
+                    use_private_auth = True
+                    print("[SHADOW][WS] promoting private auth from env credentials")
+                print(
+                    f"[SHADOW][WS] private_auth_effective={use_private_auth} "
+                    f"key_id_present={key_id_present} private_key_present={private_key_present}"
+                )
                 ws_quotes = _ws_ticker_snapshot(
                     market_tickers=ws_sports_tickers,
-                    use_private_auth=bool(cfg.get("sports_ws_use_private_auth", False)),
+                    use_private_auth=use_private_auth,
                     timeout_s=float(cfg.get("sports_ws_timeout_seconds", 15.0)),
                 )
                 print(f"[SHADOW][WS] sports snapshot_tickers={len(ws_quotes)}")

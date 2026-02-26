@@ -15,6 +15,7 @@ DEFAULT_MAIN_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 DEFAULT_MAIN_HOST = "api.elections.kalshi.com"
 _DATE_TOKEN_RE = re.compile(r"-(\d{2}[A-Z]{3}\d{2})-")
 _DATE_TOKEN_FULL_RE = re.compile(r"^\d{2}[A-Z]{3}\d{2}$")
+_SERIES_DATE_PREFIX_RE = re.compile(r"^(?P<series>[A-Z0-9]+)-(?P<date>\d{2}[A-Z]{3}\d{2})(?:$|-)")
 _DEBUG_PREFIX = "[KALSHI_DEBUG]"
 _DEBUG_PAYLOAD_CHARS = 500
 
@@ -426,6 +427,20 @@ def _event_ticker_from_market_ticker(market_ticker: str) -> str:
     return ""
 
 
+def _series_date_from_input(value: str) -> Optional[Tuple[str, str]]:
+    s = str(value or "").strip().upper()
+    if not s:
+        return None
+    m = _SERIES_DATE_PREFIX_RE.match(s)
+    if not m:
+        return None
+    series = str(m.group("series") or "").strip().upper()
+    token = str(m.group("date") or "").strip().upper()
+    if not series or not token:
+        return None
+    return (series, token)
+
+
 def get_markets(
     *,
     session: requests.Session,
@@ -437,10 +452,39 @@ def get_markets(
     normalized_events: List[str] = []
     seen_events: Set[str] = set()
     for raw in event_tickers:
-        et = str(raw or "").strip().upper()
-        if not et:
+        source = str(raw or "").strip().upper()
+        if not source:
             continue
-        inferred = _event_ticker_from_market_ticker(et)
+        series_date = _series_date_from_input(source)
+        if series_date is not None:
+            series, token = series_date
+            expanded = fetch_open_event_tickers_for_date(
+                session=session,
+                date_token=token,
+                series_ticker=series,
+                base_url=base_url,
+                max_pages=max(1, min(int(max_events), 20)),
+                status="open",
+            )
+            if expanded:
+                _debug(
+                    f"get_markets expanded_prefix input={source} series={series} token={token} "
+                    f"events={expanded[:10]} count={len(expanded)}"
+                )
+                for et in expanded:
+                    e = str(et or "").strip().upper()
+                    if not e or e in seen_events:
+                        continue
+                    seen_events.add(e)
+                    normalized_events.append(e)
+                continue
+            _debug(
+                f"get_markets prefix expansion empty input={source} "
+                f"series={series} token={token}"
+            )
+
+        et = source
+        inferred = _event_ticker_from_market_ticker(source)
         if inferred:
             if inferred != et:
                 _debug(
