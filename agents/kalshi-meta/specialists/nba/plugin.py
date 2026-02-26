@@ -47,12 +47,14 @@ _NBA_TEAM_ALIASES: Dict[str, str] = {
 _ODDS_BASE_URL = "https://api.the-odds-api.com/v4"
 _ODDS_SPORT_KEY = "basketball_nba"
 _ODDS_MARKET = "h2h"
-_ODDS_MIN_POLL_SECONDS = 600.0  # Free-tier guard: no faster than every 10 minutes.
+_ODDS_MIN_POLL_SECONDS = 180.0
+_ORACLE_CACHE_TTL_SECONDS = 180.0
 
 _ODDS_CACHE_LAST_FETCH_MONO = 0.0
 _ODDS_CACHE_PAIR_PROBS: Dict[FrozenSet[str], Dict[str, float]] = {}
 _ODDS_CACHE_LOGGED_KEY_STATE = False
 _ODDS_CACHE_LAST_ERROR_WAS_401 = False
+_ORACLE_MATCHUP_CACHE: Dict[FrozenSet[str], Tuple[float, Dict[str, float]]] = {}
 
 _NBA_TEAM_NAME_TO_CODE: Dict[str, str] = {v: k for k, v in _NBA_TEAM_CODE_TO_NAME.items()}
 _NBA_MANUAL_401_PROBS: Dict[FrozenSet[str], Dict[str, float]] = {
@@ -109,11 +111,8 @@ def _odds_api_key(config: Dict[str, object]) -> str:
 
 
 def _odds_poll_seconds(config: Dict[str, object]) -> float:
-    raw = config.get("nba_odds_poll_seconds", _ODDS_MIN_POLL_SECONDS)
-    try:
-        return max(_ODDS_MIN_POLL_SECONDS, float(raw))
-    except Exception:
-        return _ODDS_MIN_POLL_SECONDS
+    # Dual-mode throttle valve: hard cap live odds refresh cadence at 180s.
+    return float(_ORACLE_CACHE_TTL_SECONDS)
 
 
 def _extract_bookmaker_h2h_probs(bookmaker: Dict[str, object]) -> Optional[Dict[str, float]]:
@@ -152,7 +151,7 @@ def _extract_bookmaker_h2h_probs(bookmaker: Dict[str, object]) -> Optional[Dict[
 
 
 def _refresh_odds_pair_probabilities(config: Dict[str, object]) -> Dict[FrozenSet[str], Dict[str, float]]:
-    global _ODDS_CACHE_LAST_FETCH_MONO, _ODDS_CACHE_PAIR_PROBS, _ODDS_CACHE_LOGGED_KEY_STATE, _ODDS_CACHE_LAST_ERROR_WAS_401
+    global _ODDS_CACHE_LAST_FETCH_MONO, _ODDS_CACHE_PAIR_PROBS, _ODDS_CACHE_LOGGED_KEY_STATE, _ODDS_CACHE_LAST_ERROR_WAS_401, _ORACLE_MATCHUP_CACHE
 
     api_key = _odds_api_key(config)
     if not _ODDS_CACHE_LOGGED_KEY_STATE:
@@ -163,7 +162,7 @@ def _refresh_odds_pair_probabilities(config: Dict[str, object]) -> Dict[FrozenSe
 
     now_mono = time.monotonic()
     poll_s = _odds_poll_seconds(config)
-    if _ODDS_CACHE_PAIR_PROBS and (now_mono - float(_ODDS_CACHE_LAST_FETCH_MONO)) < float(poll_s):
+    if (now_mono - float(_ODDS_CACHE_LAST_FETCH_MONO)) < float(poll_s):
         return dict(_ODDS_CACHE_PAIR_PROBS)
 
     url = f"{_ODDS_BASE_URL}/sports/{_ODDS_SPORT_KEY}/odds"
@@ -184,17 +183,20 @@ def _refresh_odds_pair_probabilities(config: Dict[str, object]) -> Dict[FrozenSe
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=20.0)
         if int(resp.status_code) == 401:
+            _ODDS_CACHE_LAST_FETCH_MONO = now_mono
             _ODDS_CACHE_LAST_ERROR_WAS_401 = True
             print("[SHADOW][ORACLE] WARNING: Using Manual Hardcoded Probs due to 401 Error.")
             return dict(_ODDS_CACHE_PAIR_PROBS)
         resp.raise_for_status()
         payload = resp.json() if resp.content else []
     except Exception as exc:
+        _ODDS_CACHE_LAST_FETCH_MONO = now_mono
         print(f"[SHADOW][ORACLE] Odds API fetch failed: {exc}")
         return dict(_ODDS_CACHE_PAIR_PROBS)
 
     _ODDS_CACHE_LAST_ERROR_WAS_401 = False
     if not isinstance(payload, list):
+        _ODDS_CACHE_LAST_FETCH_MONO = now_mono
         print("[SHADOW][ORACLE] Odds API payload invalid (expected list)")
         return dict(_ODDS_CACHE_PAIR_PROBS)
     if len(payload) == 0:
@@ -233,6 +235,12 @@ def _refresh_odds_pair_probabilities(config: Dict[str, object]) -> Dict[FrozenSe
 
     _ODDS_CACHE_LAST_FETCH_MONO = now_mono
     _ODDS_CACHE_PAIR_PROBS = pair_probs
+    for key, probs in pair_probs.items():
+        _ORACLE_MATCHUP_CACHE[key] = (now_mono, dict(probs))
+    stale_cutoff = now_mono - (float(_ORACLE_CACHE_TTL_SECONDS) * 2.0)
+    _ORACLE_MATCHUP_CACHE = {
+        k: v for k, v in _ORACLE_MATCHUP_CACHE.items() if float(v[0]) >= stale_cutoff
+    }
     print(f"[SHADOW][ORACLE] NBA odds refresh pairs={len(pair_probs)} poll_s={int(poll_s)}")
     return dict(_ODDS_CACHE_PAIR_PROBS)
 
@@ -263,15 +271,34 @@ def lookup_nba_live_p_true(
     if not selected_team:
         return None
 
+    matchup_key = frozenset({team_a, team_b})
+    now_mono = time.monotonic()
+    cached = _ORACLE_MATCHUP_CACHE.get(matchup_key)
+    if cached is not None and (now_mono - float(cached[0])) < float(_ORACLE_CACHE_TTL_SECONDS):
+        cached_probs = cached[1]
+        cached_p = cached_probs.get(selected_team)
+        if cached_p is not None and 0.0 <= float(cached_p) <= 1.0:
+            age_s = now_mono - float(cached[0])
+            print(f"[SHADOW][ORACLE] NBA cache hit matchup={team_a_code}/{team_b_code} age_s={age_s:.1f}")
+            return float(cached_p)
+
     pair_probs = _refresh_odds_pair_probabilities(config)
     if _ODDS_CACHE_LAST_ERROR_WAS_401:
         manual = _NBA_MANUAL_401_PROBS.get(frozenset({team_a_code, team_b_code}), {})
         if selected_team_code and selected_team_code in manual:
             print("[SHADOW][ORACLE] WARNING: Using Manual Hardcoded Probs due to 401 Error.")
             return float(manual[selected_team_code])
-    game_probs = pair_probs.get(frozenset({team_a, team_b}))
+    game_probs = pair_probs.get(matchup_key)
     if not game_probs:
+        if cached is not None:
+            cached_probs = cached[1]
+            cached_p = cached_probs.get(selected_team)
+            if cached_p is not None and 0.0 <= float(cached_p) <= 1.0:
+                age_s = now_mono - float(cached[0])
+                print(f"[SHADOW][ORACLE] NBA stale-cache fallback matchup={team_a_code}/{team_b_code} age_s={age_s:.1f}")
+                return float(cached_p)
         return None
+    _ORACLE_MATCHUP_CACHE[matchup_key] = (now_mono, dict(game_probs))
     p_true = game_probs.get(selected_team)
     if p_true is None:
         return None

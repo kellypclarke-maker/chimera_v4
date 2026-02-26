@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import asyncio
 import argparse
+import asyncio
 import csv
-import re
 import datetime as dt
 import json
+import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -1772,12 +1773,38 @@ def _evaluate_yes_pricing(
         price = float(intended) / 100.0
         fee_rate = _shadow_fee_rate(config, execution_mode=mode)
         fees = taker_fee_dollars(contracts=1, price=price, rate=fee_rate)
-        ev = float(p_true) - price - float(fees) - slippage_dollars
+        ev_raw = float(p_true) - price - float(fees) - slippage_dollars
+        taker_fee_floor = float(config.get("shadow_taker_conservative_fee_dollars", 0.0175))
+        ev = float(ev_raw) - float(taker_fee_floor)
+        min_net_ev = float(config.get("shadow_taker_min_net_ev_dollars", 0.01))
+        if ev <= min_net_ev:
+            return {
+                "ok": False,
+                "execution_mode": mode,
+                "reason": f"taker_net_ev_below_min:{ev:.6f}<={min_net_ev:.6f}",
+            }
     else:
         join_ticks = int(config.get(join_ticks_key, 1))
-        intended = intended_maker_yes_price(yes_bid=yes_bid, yes_ask=yes_ask, join_ticks=join_ticks)
+        maker_wide_spread_cents = max(1, int(config.get("maker_wide_spread_cents", 8)))
+        maker_margin_cents = max(1, int(config.get("maker_margin_cents", 5)))
+        ceiling_cents = int(math.floor(float(p_true) * 100.0)) - maker_margin_cents
+        if ceiling_cents < 1:
+            return {"ok": False, "reason": "maker_ceiling_below_min"}
+
+        intended_default = intended_maker_yes_price(yes_bid=yes_bid, yes_ask=yes_ask, join_ticks=join_ticks)
+        spread = None if (yes_bid is None or yes_ask is None) else int(yes_ask) - int(yes_bid)
+        use_penny = bool(yes_bid is not None and spread is not None and spread >= maker_wide_spread_cents)
+        if use_penny:
+            intended = int(yes_bid) + 1
+        else:
+            intended = intended_default
         if intended is None:
             return {"ok": False, "reason": "intended_price_unavailable"}
+        if yes_ask is not None:
+            intended = min(intended, int(yes_ask) - 1)
+        intended = min(intended, ceiling_cents)
+        if intended < 1 or intended > 99:
+            return {"ok": False, "reason": "maker_intended_out_of_range"}
 
         p_fill = maker_fill_prob(yes_bid, yes_ask, intended)
         if p_fill <= 0.0:
@@ -2318,7 +2345,9 @@ def _update_open_order_lifecycle(
     yes_bid = safe_int(market.get("yes_bid"))
     yes_ask = safe_int(market.get("yes_ask"))
     print(
-        f"[SHADOW][EVAL] ticker={ticker} category={category or 'NA'} strategy={strategy_id or 'NA'} "
+        f"[SHADOW][EVAL] "
+        f"{('[TAKER_MODE]' if _shadow_execution_mode(config) == 'taker' else '[MAKER_MODE]')} "
+        f"ticker={ticker} category={category or 'NA'} strategy={strategy_id or 'NA'} "
         f"yes_bid={yes_bid} yes_ask={yes_ask}"
     )
     if category == "Climate and Weather" or strategy_id.startswith("WTHR_"):
@@ -2333,8 +2362,10 @@ def _update_open_order_lifecycle(
         eval_out = {"ok": False, "reason": "unsupported_strategy_or_category"}
 
     if isinstance(eval_out, dict) and bool(eval_out.get("ok")):
+        mode_label = str(eval_out.get("execution_mode") or "").strip().lower()
+        mode_tag = "[TAKER_MODE]" if mode_label == "taker" else "[MAKER_MODE]"
         print(
-            f"[SHADOW][EVAL] ticker={ticker} model={str(eval_out.get('model') or '')} "
+            f"[SHADOW][EVAL] {mode_tag} ticker={ticker} model={str(eval_out.get('model') or '')} "
             f"p_true={float(eval_out.get('p_true') or 0.0):.6f} "
             f"ev={float(eval_out.get('ev_dollars') or 0.0):.6f} "
             f"intended={int(float(str(eval_out.get('intended_price_cents') or '0') or '0'))}"
