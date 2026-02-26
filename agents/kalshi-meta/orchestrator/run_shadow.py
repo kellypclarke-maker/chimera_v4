@@ -90,6 +90,7 @@ DEFAULT_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 _KALSHI_MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 _DATE_TOKEN_FULL_RE = re.compile(r"^\d{2}[A-Z]{3}\d{2}$")
 _SPORTS_EVENT_PREFIXES: Tuple[str, ...] = ("KXNBAGAME-", "KXNHLGAME-")
+_SPORTS_DIRECT_MARKET_SUFFIXES: Tuple[str, ...] = ("MIA", "PHI", "CHA", "IND", "NYR")
 
 
 def log_shadow_trade(
@@ -784,6 +785,18 @@ def _sorted_with_priority_prefix(
     return sorted(items, key=lambda t: (0 if t.startswith(pref) else 1, t))
 
 
+def _is_direct_market_override_ticker(ticker: str) -> bool:
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return False
+    if t.count("-") < 2:
+        return False
+    if not _is_sports_ticker(t):
+        return False
+    tail = t.rsplit("-", 1)[-1]
+    return tail in _SPORTS_DIRECT_MARKET_SUFFIXES
+
+
 def _load_queue_tickers_from_md(path: Path) -> List[str]:
     if not path.exists():
         return []
@@ -1035,8 +1048,60 @@ def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], co
         base_url = str(cfg.get("base_url") or DEFAULT_BASE).strip().rstrip("/") or DEFAULT_BASE
         existing = {str(r.get("ticker") or "").strip().upper() for r in out}
         force_count = 0
+        direct_added = 0
         with requests.Session() as s:
             for event_prefix in sorted({str(x).strip().upper() for x in tickers_override if str(x).strip()}):
+                if _is_direct_market_override_ticker(event_prefix):
+                    ticker = event_prefix
+                    if ticker not in existing:
+                        event_ticker = ticker.rsplit("-", 1)[0]
+                        category = "Sports"
+                        forced = _build_candidate_row_from_market(
+                            market={
+                                "ticker": ticker,
+                                "event_ticker": event_ticker,
+                                "title": "",
+                                "status": "open",
+                            },
+                            category=category,
+                            p_true=0.5,
+                            extra_notes="source=cli_tickers_override_direct_market",
+                        )
+                        if forced is None:
+                            forced = {
+                                "strategy_id": "",
+                                "ticker": ticker,
+                                "event_ticker": event_ticker,
+                                "title": "",
+                                "category": category,
+                                "close_time": "",
+                                "action": "post_yes",
+                                "maker_or_taker": "maker",
+                                "yes_price_cents": "50",
+                                "yes_bid": "",
+                                "yes_ask": "",
+                                "no_bid": "",
+                                "no_ask": "",
+                                "ev_dollars": "",
+                                "fees_assumed_dollars": "0.0",
+                                "slippage_assumed_dollars": "0.0",
+                                "rules_text_hash": "",
+                                "rules_pointer": "",
+                                "resolution_pointer": "",
+                                "liquidity_notes": "source=cli_tickers_override_direct_market;p_true=0.500000",
+                                "p_true": "0.500000",
+                                "data_as_of_ts": _utc_now_iso(),
+                                "market_url": "",
+                            }
+                        out.append(forced)
+                        existing.add(ticker)
+                        force_count += 1
+                        direct_added += 1
+                    print(
+                        f"[DEBUG] --tickers direct market override accepted ticker={event_prefix} "
+                        "expansion=skipped"
+                    )
+                    continue
                 try:
                     markets = fetch_public_markets(
                         session=s,
@@ -1111,7 +1176,10 @@ def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], co
                     f"[DEBUG] Force-approved override prefix={event_prefix} "
                     f"added_markets={prefix_added}"
                 )
-        print(f"[DEBUG] --tickers force-approve added={force_count} total={len(out)}")
+        print(
+            f"[DEBUG] --tickers force-approve added={force_count} "
+            f"direct_markets={direct_added} total={len(out)}"
+        )
 
     live_rows: List[Dict[str, str]] = []
     if not tickers_override:
