@@ -665,6 +665,14 @@ def _load_daily_candidates(path: Path) -> Dict[str, Dict[str, str]]:
     return out
 
 
+def _ticker_matches_date_token(*, ticker: str, date_token: str) -> bool:
+    t = str(ticker or "").strip().upper()
+    tok = str(date_token or "").strip().upper()
+    if not tok:
+        return True
+    return tok in t
+
+
 def _debug_preview_event_tickers_from_api(*, day: str, config: Dict[str, Any]) -> None:
     base_url = str(config.get("base_url") or DEFAULT_BASE).strip().rstrip("/") or DEFAULT_BASE
     series: List[str] = []
@@ -825,6 +833,7 @@ def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], co
         candidates = {t: row for t, row in candidates.items() if t in allow}
         print(f"[SHADOW][DISCOVERY] --tickers override applied count={len(candidates)}")
 
+    date_token = _kalshi_date_token_from_iso(day) or str(day).strip().upper()
     out: List[Dict[str, str]] = []
     for t, row in sorted(candidates.items()):
         action = str(row.get("action") or "").strip().lower()
@@ -836,8 +845,77 @@ def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], co
             continue
         if not yes_px:
             continue
+        ticker = str(row.get("ticker") or "").strip().upper()
+        if tickers_override:
+            # Explicit --tickers must always be force-approved.
+            out.append(row)
+            continue
+        if not _ticker_matches_date_token(ticker=ticker, date_token=date_token):
+            print(
+                f"[DEBUG] Discarded {ticker or '<missing>'} due to missing date token "
+                f"{date_token} in ticker"
+            )
+            continue
         out.append(row)
     cfg = config if isinstance(config, dict) else {}
+    if tickers_override:
+        base_url = str(cfg.get("base_url") or DEFAULT_BASE).strip().rstrip("/") or DEFAULT_BASE
+        existing = {str(r.get("ticker") or "").strip().upper() for r in out}
+        force_count = 0
+        with requests.Session() as s:
+            for t in sorted({str(x).strip().upper() for x in tickers_override if str(x).strip()}):
+                if t in existing:
+                    continue
+                try:
+                    market = _fetch_market(session=s, base_url=base_url, ticker=t)
+                except Exception as exc:
+                    print(f"[DEBUG] --tickers force-approve fallback for {t}: market fetch failed: {exc}")
+                    market = {"ticker": t, "event_ticker": "", "title": "", "status": "open"}
+                category = "Other"
+                if t.startswith("KXBTC-") or t.startswith("KXETH-") or t.startswith("KXSOL"):
+                    category = "Crypto"
+                elif t.startswith("KXHIGH") or t.startswith("KXLOW"):
+                    category = "Climate and Weather"
+                elif t.startswith("KXNBA") or t.startswith("KXNHL"):
+                    category = "Sports"
+                forced = _build_candidate_row_from_market(
+                    market=market,
+                    category=category,
+                    p_true=0.5,
+                    extra_notes="source=cli_tickers_override",
+                )
+                if forced is None:
+                    forced = {
+                        "strategy_id": "",
+                        "ticker": t,
+                        "event_ticker": "",
+                        "title": "",
+                        "category": category,
+                        "close_time": "",
+                        "action": "post_yes",
+                        "maker_or_taker": "maker",
+                        "yes_price_cents": "50",
+                        "yes_bid": "",
+                        "yes_ask": "",
+                        "no_bid": "",
+                        "no_ask": "",
+                        "ev_dollars": "",
+                        "fees_assumed_dollars": "0.0",
+                        "slippage_assumed_dollars": "0.0",
+                        "rules_text_hash": "",
+                        "rules_pointer": "",
+                        "resolution_pointer": "",
+                        "liquidity_notes": "source=cli_tickers_override;p_true=0.500000",
+                        "p_true": "0.500000",
+                        "data_as_of_ts": _utc_now_iso(),
+                        "market_url": "",
+                    }
+                out.append(forced)
+                existing.add(t)
+                force_count += 1
+                print(f"[DEBUG] Force-approved override ticker={t}")
+        print(f"[DEBUG] --tickers force-approve added={force_count} total={len(out)}")
+
     live_rows: List[Dict[str, str]] = []
     if not tickers_override:
         live_rows = _bootstrap_candidates_from_live_discovery(day=day, config=cfg)
@@ -851,6 +929,12 @@ def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], co
             }
             for row in live_rows:
                 t = str(row.get("ticker") or "").strip().upper()
+                if not _ticker_matches_date_token(ticker=t, date_token=date_token):
+                    print(
+                        f"[DEBUG] Discarded {t or '<missing>'} due to missing date token "
+                        f"{date_token} in ticker"
+                    )
+                    continue
                 if t and t not in merged:
                     merged[t] = row
             out = list(merged.values())
@@ -1316,11 +1400,21 @@ def _fetch_market(*, session: requests.Session, base_url: str, ticker: str) -> D
             d = _safe_float_local(out.get("yes_ask_dollars"))
             if d is not None and d > 0.0:
                 out["yes_ask"] = int(round(float(d) * 100.0))
+        no_bid = _safe_int_local(out.get("no_bid"))
+        if no_bid is None or no_bid <= 0:
+            d = _safe_float_local(out.get("no_bid_dollars"))
+            if d is not None and d > 0.0:
+                out["no_bid"] = int(round(float(d) * 100.0))
+        no_ask = _safe_int_local(out.get("no_ask"))
+        if no_ask is None or no_ask <= 0:
+            d = _safe_float_local(out.get("no_ask_dollars"))
+            if d is not None and d > 0.0:
+                out["no_ask"] = int(round(float(d) * 100.0))
         yes_bid_size = _safe_int_local(out.get("yes_bid_size"))
         if yes_bid_size is None or yes_bid_size <= 0:
             fp = _safe_float_local(out.get("yes_bid_size_fp"))
             if fp is not None and fp > 0.0:
-                out["yes_bid_size"] = int(float(fp))
+                out["yes_bid_size"] = int(float(fp) * 100.0)
         return out
 
     resp = session.get(f"{base_url}/markets/{ticker}", timeout=30.0)

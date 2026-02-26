@@ -1,8 +1,8 @@
 # Shadow Summary 26FEB26
 
-- Generated: `2026-02-26T19:13:23.697000+00:00`
+- Generated: `2026-02-26T20:47:39.001481+00:00`
 - Mode: `paper/shadow only`
-- Poll seconds: `1.5`
+- Poll seconds: `1.0`
 - Max runtime minutes: `180.0`
 - Orders tracked: `0`
 - Open: `0`

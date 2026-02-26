@@ -23,6 +23,7 @@ from specialists.helpers import (
 )
 
 _P_TRUE_RE = re.compile(r"\bp_true(?:_cal)?=([0-9]*\.?[0-9]+)")
+_NBA_TEAMS = ("CHA", "IND", "MIA", "PHI")
 
 
 def _safe_float(raw: object) -> Optional[float]:
@@ -41,12 +42,17 @@ def _is_nba_row(row: Dict[str, str]) -> bool:
     ticker = str(row.get("ticker") or "").strip().upper()
     event_ticker = str(row.get("event_ticker") or "").strip().upper()
     title = str(row.get("title") or "").strip().upper()
+    blob = " ".join([ticker, event_ticker, title]).upper()
+    has_focus_team = any(team in blob for team in _NBA_TEAMS)
     category = category_from_row(row).strip().lower()
     return (
-        ticker.startswith("KXNBA")
-        or event_ticker.startswith("KXNBA")
-        or " NBA " in f" {title} "
-        or category == "sports"
+        has_focus_team
+        and (
+            ticker.startswith("KXNBA")
+            or event_ticker.startswith("KXNBA")
+            or " NBA " in f" {title} "
+            or category == "sports"
+        )
     )
 
 
@@ -72,7 +78,7 @@ def discover_nba_startup_tickers(*, day_iso: str, config: Dict[str, object]) -> 
     max_markets = max(1, int(config.get("shadow_bootstrap_max_nba_markets", 120)))
     try:
         with requests.Session() as s:
-            return discover_market_tickers_for_series_date(
+            discovered = discover_market_tickers_for_series_date(
                 session=s,
                 date_token=token,
                 series_ticker=series,
@@ -81,6 +87,8 @@ def discover_nba_startup_tickers(*, day_iso: str, config: Dict[str, object]) -> 
                 max_events=max_events,
                 max_markets_per_event=max_markets,
             )
+            filtered = [t for t in discovered if any(team in str(t).upper() for team in _NBA_TEAMS)]
+            return filtered
     except Exception:
         return []
 

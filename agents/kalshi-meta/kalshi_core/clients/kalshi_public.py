@@ -221,7 +221,7 @@ def _size_from_fp(value: object) -> Optional[int]:
     v = _safe_float(value)
     if v is None:
         return None
-    return int(float(v))
+    return int(float(v) * 100.0)
 
 
 def _normalize_market_quotes(market: Dict[str, Any]) -> Dict[str, Any]:
@@ -246,6 +246,26 @@ def _normalize_market_quotes(market: Dict[str, Any]) -> Dict[str, Any]:
             _debug(
                 f"quote_fallback ticker={ticker} field=yes_ask source=yes_ask_dollars "
                 f"raw={out.get('yes_ask_dollars')} cents={out['yes_ask']}"
+            )
+
+    no_bid = _safe_int(out.get("no_bid"))
+    if no_bid is None or no_bid <= 0:
+        fallback_no_bid = _cents_from_dollars(out.get("no_bid_dollars"))
+        if fallback_no_bid is not None and fallback_no_bid > 0:
+            out["no_bid"] = int(fallback_no_bid)
+            _debug(
+                f"quote_fallback ticker={ticker} field=no_bid source=no_bid_dollars "
+                f"raw={out.get('no_bid_dollars')} cents={out['no_bid']}"
+            )
+
+    no_ask = _safe_int(out.get("no_ask"))
+    if no_ask is None or no_ask <= 0:
+        fallback_no_ask = _cents_from_dollars(out.get("no_ask_dollars"))
+        if fallback_no_ask is not None and fallback_no_ask > 0:
+            out["no_ask"] = int(fallback_no_ask)
+            _debug(
+                f"quote_fallback ticker={ticker} field=no_ask source=no_ask_dollars "
+                f"raw={out.get('no_ask_dollars')} cents={out['no_ask']}"
             )
 
     yes_bid_size = _safe_int(out.get("yes_bid_size"))
@@ -393,6 +413,85 @@ def fetch_event(
     return payload if isinstance(payload, dict) else {}
 
 
+def _event_ticker_from_market_ticker(market_ticker: str) -> str:
+    mt = str(market_ticker or "").strip().upper()
+    if not mt:
+        return ""
+    m = _DATE_TOKEN_RE.search(mt)
+    if m:
+        return mt[: m.end(1)]
+    parts = [p for p in mt.split("-") if p]
+    if len(parts) >= 2:
+        return f"{parts[0]}-{parts[1]}"
+    return ""
+
+
+def get_markets(
+    *,
+    session: requests.Session,
+    event_tickers: Sequence[str],
+    base_url: Optional[str] = None,
+    max_events: int = 80,
+) -> List[Dict[str, Any]]:
+    """Fetch market rows by event ticker using /events/{event_ticker}."""
+    normalized_events: List[str] = []
+    seen_events: Set[str] = set()
+    for raw in event_tickers:
+        et = str(raw or "").strip().upper()
+        if not et:
+            continue
+        inferred = _event_ticker_from_market_ticker(et)
+        if inferred:
+            if inferred != et:
+                _debug(
+                    f"get_markets converted_input input={et} "
+                    f"event_ticker={inferred}"
+                )
+            et = inferred
+        if et in seen_events:
+            continue
+        seen_events.add(et)
+        normalized_events.append(et)
+
+    out: List[Dict[str, Any]] = []
+    for et in normalized_events[: max(1, int(max_events))]:
+        try:
+            event = fetch_event(session=session, event_ticker=et, base_url=base_url)
+        except Exception as exc:
+            _debug(f"get_markets discard event_ticker={et} reason=fetch_event_error error={exc}")
+            continue
+        markets = event.get("markets") if isinstance(event, dict) else None
+        if not isinstance(markets, list):
+            _debug(
+                f"get_markets discard event_ticker={et} reason=markets_not_list "
+                f"markets_type={type(markets).__name__}"
+            )
+            continue
+
+        raw_market_tickers: List[str] = []
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            mt = str(market.get("ticker") or "").strip().upper()
+            if mt:
+                raw_market_tickers.append(mt)
+        _debug(
+            f"get_markets raw_tickers_first10 event_ticker={et} "
+            f"total={len(raw_market_tickers)} tickers={raw_market_tickers[:10]}"
+        )
+
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            normalized = _normalize_market_quotes(market)
+            if not str(normalized.get("event_ticker") or "").strip():
+                normalized["event_ticker"] = et
+            out.append(normalized)
+
+    _debug(f"get_markets return total_markets={len(out)} event_count={len(normalized_events)}")
+    return out
+
+
 def _sample_open_market_tickers_for_series(
     *,
     session: requests.Session,
@@ -489,17 +588,14 @@ def discover_market_tickers_for_series_date(
     open_market_sample_seen: Set[str] = set()
     for event_ticker in event_tickers[: max(1, int(max_events))]:
         _debug(f"discover_market_tickers_for_series_date fetch event_ticker={event_ticker}")
-        try:
-            event = fetch_event(session=session, event_ticker=event_ticker, base_url=base_url)
-        except Exception as exc:
-            _debug(f"discard event_ticker={event_ticker} reason=fetch_event_error error={exc}")
-            continue
-        markets = event.get("markets") if isinstance(event, dict) else None
-        if not isinstance(markets, list):
-            _debug(
-                f"discard event_ticker={event_ticker} reason=markets_not_list "
-                f"markets_type={type(markets).__name__} event_keys={list(event.keys()) if isinstance(event, dict) else []}"
-            )
+        markets = get_markets(
+            session=session,
+            event_tickers=[event_ticker],
+            base_url=base_url,
+            max_events=1,
+        )
+        if not markets:
+            _debug(f"discard event_ticker={event_ticker} reason=no_markets_from_get_markets")
             continue
         _debug(f"event_ticker={event_ticker} markets_count={len(markets)}")
         for market in markets[: max(1, int(max_markets_per_event))]:
@@ -693,17 +789,14 @@ def discover_viable_crypto_tickers_for_date(
     fallback_open: Set[str] = set()
     for event_ticker in event_tickers:
         _debug(f"discover_viable_crypto_tickers_for_date fetch event_ticker={event_ticker}")
-        try:
-            event = fetch_event(session=session, event_ticker=event_ticker, base_url=base_url)
-        except Exception as exc:
-            _debug(f"discard event_ticker={event_ticker} reason=fetch_event_error error={exc}")
-            continue
-        markets = event.get("markets") if isinstance(event, dict) else None
-        if not isinstance(markets, list):
-            _debug(
-                f"discard event_ticker={event_ticker} reason=markets_not_list "
-                f"markets_type={type(markets).__name__} event_keys={list(event.keys()) if isinstance(event, dict) else []}"
-            )
+        markets = get_markets(
+            session=session,
+            event_tickers=[event_ticker],
+            base_url=base_url,
+            max_events=1,
+        )
+        if not markets:
+            _debug(f"discard event_ticker={event_ticker} reason=no_markets_from_get_markets")
             continue
         _debug(f"event_ticker={event_ticker} markets_count={len(markets)}")
         for market in markets:
