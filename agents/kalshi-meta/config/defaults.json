@@ -48,6 +48,7 @@
   "nhl_join_ticks": 1,
   "nhl_slippage_cents_per_contract": 0.25,
   "nhl_min_ev_dollars": 0.0,
+  "nhl_odds_poll_seconds": 600.0,
   "shadow_seen_trade_ids_max": 2000,
   "max_open_orders_per_event": 1,
   "base_size_contracts": 1

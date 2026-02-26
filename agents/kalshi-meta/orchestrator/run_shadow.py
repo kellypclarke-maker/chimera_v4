@@ -70,7 +70,7 @@ from specialists.weather.plugin import (
     _station_id_from_rules,
 )
 from specialists.nba.plugin import discover_nba_startup_tickers, lookup_nba_live_p_true
-from specialists.nhl.plugin import discover_nhl_startup_tickers
+from specialists.nhl.plugin import discover_nhl_startup_tickers, lookup_nhl_live_p_true
 
 from specialists.crypto.plugin import (
     _estimate_sigma_and_spot_from_candles as _crypto_estimate_sigma_and_spot_from_candles,
@@ -602,7 +602,7 @@ def _load_env_list_defaults(path: Path) -> None:
         print(f"[DEBUG] Env defaults file not found. checked={list(seen)}")
         return
 
-    loaded = 0
+    set_count = 0
     parsed = 0
     for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = str(raw_line or "").strip()
@@ -618,11 +618,10 @@ def _load_env_list_defaults(path: Path) -> None:
             continue
         value = str(v or "").strip().strip('"').strip("'")
         parsed += 1
-        print(f"[DEBUG] Found potential key: {key} (length: {len(value)})")
-        if not str(os.environ.get(key) or "").strip():
-            os.environ[key] = value
-            loaded += 1
-    print(f"[DEBUG] Env defaults loaded from {env_path} parsed={parsed} set={loaded}")
+        os.environ[key] = value
+        set_count += 1
+        print(f"[DEBUG] Force-set key: {key}.")
+    print(f"[DEBUG] Env defaults loaded from {env_path} parsed={parsed} set={set_count}")
 
 
 def _as_bool(value: Any, *, default: bool = False) -> bool:
@@ -1615,6 +1614,16 @@ def _evaluate_sports_edge(
         if live_nba is None:
             return {"ok": False, "reason": "nba_live_odds_missing"}
         p_true = float(live_nba)
+    elif strategy.startswith("NHL_") or ticker.startswith("KXNHL"):
+        live_nhl = lookup_nhl_live_p_true(
+            ticker=ticker,
+            event_ticker=event_ticker,
+            title=title,
+            config=config,
+        )
+        if live_nhl is None:
+            return {"ok": False, "reason": "nhl_live_odds_missing"}
+        p_true = float(live_nhl)
     else:
         p_true = _p_true_from_order(order)
     if p_true is None:
