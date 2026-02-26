@@ -92,6 +92,10 @@ _DATE_TOKEN_FULL_RE = re.compile(r"^\d{2}[A-Z]{3}\d{2}$")
 _SPORTS_EVENT_PREFIXES: Tuple[str, ...] = ("KXNBAGAME-", "KXNHLGAME-")
 _SPORTS_DIRECT_MARKET_SUFFIXES: Tuple[str, ...] = ("MIA", "PHI", "CHA", "IND", "NYR")
 
+_WS_SNAPSHOT_CACHE_TICKERS: Tuple[str, ...] = ()
+_WS_SNAPSHOT_CACHE_QUOTES: Dict[str, Dict[str, Any]] = {}
+_WS_SNAPSHOT_CACHE_TS_MONO: float = 0.0
+
 
 def log_shadow_trade(
     oracle_type: str,
@@ -295,10 +299,26 @@ def _ws_ticker_snapshot(
     market_tickers: Sequence[str],
     use_private_auth: bool,
     timeout_s: float,
+    min_refresh_s: float,
 ) -> Dict[str, Dict[str, Any]]:
+    global _WS_SNAPSHOT_CACHE_TICKERS, _WS_SNAPSHOT_CACHE_QUOTES, _WS_SNAPSHOT_CACHE_TS_MONO
     tickers = sorted({str(t).strip().upper() for t in market_tickers if str(t).strip()})
     if not tickers:
         return {}
+    now_mono = time.monotonic()
+    refresh_s = max(0.0, float(min_refresh_s))
+    if (
+        refresh_s > 0.0
+        and _WS_SNAPSHOT_CACHE_TICKERS == tuple(tickers)
+        and _WS_SNAPSHOT_CACHE_QUOTES
+        and (now_mono - float(_WS_SNAPSHOT_CACHE_TS_MONO)) < refresh_s
+    ):
+        age_s = now_mono - float(_WS_SNAPSHOT_CACHE_TS_MONO)
+        print(
+            f"[SHADOW][WS] using cached snapshot tickers={len(tickers)} "
+            f"age_s={age_s:.2f} refresh_s={refresh_s:.2f}"
+        )
+        return {k: dict(v) for k, v in _WS_SNAPSHOT_CACHE_QUOTES.items()}
     print(f"[SHADOW][WS] connecting for ticker snapshot count={len(tickers)} timeout_s={float(timeout_s):.1f}")
     try:
         out = asyncio.run(
@@ -309,6 +329,10 @@ def _ws_ticker_snapshot(
             )
         )
         print(f"[SHADOW][WS] snapshot received={len(out)}")
+        if out:
+            _WS_SNAPSHOT_CACHE_TICKERS = tuple(tickers)
+            _WS_SNAPSHOT_CACHE_QUOTES = {k: dict(v) for k, v in out.items()}
+            _WS_SNAPSHOT_CACHE_TS_MONO = now_mono
         return out
     except Exception:
         print("[SHADOW][WS] snapshot failed; falling back to REST")
@@ -2321,6 +2345,15 @@ def _update_open_order_lifecycle(
 
     if not isinstance(eval_out, dict) or not bool(eval_out.get("ok")):
         reason = str(eval_out.get("reason") if isinstance(eval_out, dict) else "model_eval_failed")
+        watch_keep_open = (
+            _is_sports_order(order)
+            and str(config.get("shadow_sports_watch_only_keep_open", "1")).strip().lower() not in {"0", "false", "no"}
+            and reason.startswith("sports_ev_below_min")
+        )
+        if watch_keep_open:
+            order["notes"] = _append_note(str(order.get("notes") or ""), f"watch_only_hold:{reason}")
+            print(f"[SHADOW][WATCH] keeping sports order open ticker={ticker} reason={reason}")
+            return
         station_id = str(eval_out.get("station_id") if isinstance(eval_out, dict) else "")
         _close_order_unfilled(
             order,
@@ -2376,6 +2409,15 @@ def _update_open_order_lifecycle(
     )
 
     if ev <= min_ev:
+        watch_keep_open = (
+            model == "sports"
+            and str(config.get("shadow_sports_watch_only_keep_open", "1")).strip().lower() not in {"0", "false", "no"}
+        )
+        if watch_keep_open:
+            reason = f"ev={ev:.6f}<=min={min_ev:.6f}"
+            order["notes"] = _append_note(str(order.get("notes") or ""), f"watch_only_hold:{reason}")
+            print(f"[SHADOW][WATCH] keeping sports order open ticker={ticker} reason={reason}")
+            return
         _close_order_unfilled(
             order,
             reason=f"edge_gone:ev={ev:.6f}",
@@ -3143,6 +3185,7 @@ def main() -> int:
                     market_tickers=ws_sports_tickers,
                     use_private_auth=use_private_auth,
                     timeout_s=float(cfg.get("sports_ws_timeout_seconds", 15.0)),
+                    min_refresh_s=float(cfg.get("sports_ws_min_refresh_seconds", 2.0)),
                 )
                 print(f"[SHADOW][WS] sports snapshot_tickers={len(ws_quotes)}")
                 if not ws_quotes:
