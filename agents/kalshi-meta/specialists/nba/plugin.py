@@ -89,11 +89,19 @@ def _parse_nba_ticker_codes(*, ticker: str, event_ticker: str) -> Optional[Tuple
 
 
 def _odds_api_key(config: Dict[str, object]) -> str:
-    return str(
+    return (
+        str(
         os.environ.get("THE_ODDS_API_KEY")
         or config.get("THE_ODDS_API_KEY")
         or ""
-    ).strip()
+        )
+        .strip()
+        .replace('"', "")
+        .replace("'", "")
+        .replace("\r", "")
+        .replace("\n", "")
+        .strip()
+    )
 
 
 def _odds_poll_seconds(config: Dict[str, object]) -> float:
@@ -155,6 +163,12 @@ def _refresh_odds_pair_probabilities(config: Dict[str, object]) -> Dict[FrozenSe
         return dict(_ODDS_CACHE_PAIR_PROBS)
 
     url = f"{_ODDS_BASE_URL}/sports/{_ODDS_SPORT_KEY}/odds"
+    key_head = api_key[:4]
+    key_tail = api_key[-4:] if len(api_key) >= 4 else api_key
+    print(
+        f"[SHADOW][ORACLE] NBA Odds key fingerprint={key_head}...{key_tail} "
+        f"len={len(api_key)}"
+    )
     params = {
         "apiKey": api_key,
         "regions": "us",
@@ -178,6 +192,8 @@ def _refresh_odds_pair_probabilities(config: Dict[str, object]) -> Dict[FrozenSe
     if not isinstance(payload, list):
         print("[SHADOW][ORACLE] Odds API payload invalid (expected list)")
         return dict(_ODDS_CACHE_PAIR_PROBS)
+    if len(payload) == 0:
+        print("[SHADOW][ORACLE] NBA Odds API returned 200 with empty list payload.")
 
     pair_probs: Dict[FrozenSet[str], Dict[str, float]] = {}
     for game in payload:
