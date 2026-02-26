@@ -2761,9 +2761,8 @@ def main() -> int:
     start_monotonic = time.monotonic()
     cycle = 0
     last_empty_discovery_attempt = 0.0
-    btc_priority_window_s = 15.0 * 60.0
-    day_token = _kalshi_date_token_from_iso(day) or str(day).strip().upper()
-    btc_priority_prefix = f"KXBTC-{day_token}17"
+    crypto_series = str(cfg.get("shadow_crypto_series_ticker", "KXBTC")).strip().upper() or "KXBTC"
+    btc_priority_prefix = f"{crypto_series}-"
 
     while True:
         cycle += 1
@@ -2802,7 +2801,7 @@ def main() -> int:
         open_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
         needed_market_tickers: set[str] = set()
         open_sports_tickers: set[str] = set()
-        priority_active = (time.monotonic() - start_monotonic) <= btc_priority_window_s
+        priority_active = True
         resolution_lookahead_minutes = float(cfg.get("shadow_resolution_lookahead_minutes", 0.0))
         resolution_cutoff = _utc_now() + dt.timedelta(minutes=float(resolution_lookahead_minutes))
         for o in orders:
@@ -2828,7 +2827,7 @@ def main() -> int:
             if btc_needed > 0:
                 print(
                     f"[SHADOW][PRIORITY] btc_priority_prefix={btc_priority_prefix} "
-                    f"active_window_s={int(btc_priority_window_s)} needed={btc_needed}"
+                    f"needed={btc_needed}"
                 )
 
         ordered_open_tickers = _sorted_with_priority_prefix(
@@ -2903,6 +2902,8 @@ def main() -> int:
                     timeout_s=float(cfg.get("sports_ws_timeout_seconds", 15.0)),
                 )
                 print(f"[SHADOW][WS] sports snapshot_tickers={len(ws_quotes)}")
+                if not ws_quotes:
+                    print("[SHADOW][WS] snapshot returned 0 sports tickers; forcing REST fallback")
                 for mt, msg in ws_quotes.items():
                     if not isinstance(msg, dict):
                         continue
@@ -2943,6 +2944,29 @@ def main() -> int:
                 except Exception:
                     continue
 
+            if tickers_override:
+                override_targets = [
+                    t
+                    for t in ordered_needed_tickers
+                    if any(
+                        str(t).startswith(str(prefix).strip().upper()) or str(prefix).strip().upper() in str(t)
+                        for prefix in tickers_override
+                        if str(prefix).strip()
+                    )
+                ]
+                for ticker in override_targets:
+                    if ticker in market_cache:
+                        continue
+                    try:
+                        market_cache[ticker] = _fetch_market(session=s, base_url=base_url, ticker=ticker)
+                        print(
+                            f"[SHADOW][WS] override REST fallback ticker={ticker} "
+                            f"yes_bid={safe_int(market_cache[ticker].get('yes_bid'))} "
+                            f"yes_ask={safe_int(market_cache[ticker].get('yes_ask'))}"
+                        )
+                    except Exception as exc:
+                        print(f"[SHADOW][WS] override REST fallback failed ticker={ticker} error={exc}")
+
         econ_state = _econ_pmf_state(config=cfg, econ_cache_dir=econ_cache_dir)
 
         # Reprice / edge-gate still-open orders.
@@ -2963,11 +2987,27 @@ def main() -> int:
                     )
                 )
                 if is_override_sports:
+                    synthetic_market = {
+                        "ticker": ticker,
+                        "event_ticker": str(order.get("event_ticker") or "").strip().upper(),
+                        "title": str(order.get("title") or ""),
+                        "yes_bid": safe_int(order.get("yes_bid")),
+                        "yes_ask": safe_int(order.get("yes_ask")),
+                        "no_bid": safe_int(order.get("no_bid")),
+                        "no_ask": safe_int(order.get("no_ask")),
+                        "status": "open",
+                    }
                     print(
-                        f"[SHADOW][EVAL] ticker={ticker} category=Sports strategy={strategy_id or 'NA'} "
-                        "yes_bid=None yes_ask=None"
+                        f"[SHADOW][WS] synthetic sports market fallback ticker={ticker} "
+                        f"strategy={strategy_id or 'NA'}"
                     )
-                    print(f"[SHADOW][EVAL] ticker={ticker} skipped reason=market_missing")
+                    _update_open_order_lifecycle(
+                        order=order,
+                        market=synthetic_market,
+                        config=cfg,
+                        weather_cache_dir=weather_cache_dir,
+                        econ_state=econ_state,
+                    )
                 continue
             _update_open_order_lifecycle(
                 order=order,

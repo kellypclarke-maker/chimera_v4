@@ -176,8 +176,9 @@ def _refresh_odds_pair_probabilities(config: Dict[str, object]) -> Dict[FrozenSe
         "oddsFormat": "decimal",
         "dateFormat": "iso",
     }
+    headers = {"Accept": "application/json"}
     try:
-        resp = requests.get(url, params=params, timeout=20.0)
+        resp = requests.get(url, params=params, headers=headers, timeout=20.0)
         if int(resp.status_code) == 401:
             _ODDS_CACHE_LAST_ERROR_WAS_401 = True
             print("[SHADOW][ORACLE] WARNING: Using Manual Hardcoded Probs due to 401 Error.")
