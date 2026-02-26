@@ -100,6 +100,12 @@ class KalshiWsClient:
             parsed = urlparse(self.ws_url)
             path = parsed.path or "/trade-api/ws/v2"
             headers = _ws_auth_headers(key_id=self._key_id, private_key_pem=self._private_key_pem, path=path)
+            print(
+                f"[KALSHI_WS] connecting url={self.ws_url} private_auth=1 "
+                f"key_id_present={bool(self._key_id)} header_keys={sorted(headers.keys())}"
+            )
+        else:
+            print(f"[KALSHI_WS] connecting url={self.ws_url} private_auth=0")
         self._ws = await websockets.connect(
             self.ws_url,
             additional_headers=headers,
@@ -168,12 +174,16 @@ async def ws_collect_ticker_snapshot(
     market_tickers: Sequence[str],
     ws_url: Optional[str] = None,
     use_private_auth: bool = False,
-    timeout_s: float = 5.0,
+    timeout_s: float = 15.0,
 ) -> Dict[str, Dict[str, Any]]:
     want = {str(t).strip().upper() for t in market_tickers if str(t).strip()}
     if not want:
         return {}
     client = KalshiWsClient(ws_url=ws_url, use_private_auth=use_private_auth)
+    print(
+        f"[KALSHI_WS] snapshot start url={client.ws_url} tickers={len(want)} "
+        f"timeout_s={float(timeout_s):.1f}"
+    )
     await client.connect()
     try:
         await client.subscribe(channels=["ticker"], market_tickers=sorted(want), send_initial_snapshot=True)

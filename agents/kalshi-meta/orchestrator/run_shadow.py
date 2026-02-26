@@ -26,6 +26,7 @@ from kalshi_core.clients.kalshi_public import (
     discover_sports_tickers_for_date,
     discover_weather_tickers_for_date,
     fetch_event as fetch_public_event,
+    get_markets as fetch_public_markets,
     fetch_open_event_tickers_for_date,
     extract_kalshi_date_token_from_ticker,
     fetch_btc_spot_rest_fallback,
@@ -829,8 +830,12 @@ def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], co
         )
 
     if tickers_override:
-        allow = {t.upper() for t in tickers_override}
-        candidates = {t: row for t, row in candidates.items() if t in allow}
+        allow_prefixes = [str(t).strip().upper() for t in tickers_override if str(t).strip()]
+        candidates = {
+            t: row
+            for t, row in candidates.items()
+            if any(str(t).strip().upper().startswith(prefix) for prefix in allow_prefixes)
+        }
         print(f"[SHADOW][DISCOVERY] --tickers override applied count={len(candidates)}")
 
     date_token = _kalshi_date_token_from_iso(day) or str(day).strip().upper()
@@ -863,57 +868,81 @@ def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], co
         existing = {str(r.get("ticker") or "").strip().upper() for r in out}
         force_count = 0
         with requests.Session() as s:
-            for t in sorted({str(x).strip().upper() for x in tickers_override if str(x).strip()}):
-                if t in existing:
-                    continue
+            for event_prefix in sorted({str(x).strip().upper() for x in tickers_override if str(x).strip()}):
                 try:
-                    market = _fetch_market(session=s, base_url=base_url, ticker=t)
+                    markets = fetch_public_markets(
+                        session=s,
+                        event_tickers=[event_prefix],
+                        base_url=base_url,
+                        max_events=1,
+                    )
                 except Exception as exc:
-                    print(f"[DEBUG] --tickers force-approve fallback for {t}: market fetch failed: {exc}")
-                    market = {"ticker": t, "event_ticker": "", "title": "", "status": "open"}
-                category = "Other"
-                if t.startswith("KXBTC-") or t.startswith("KXETH-") or t.startswith("KXSOL"):
-                    category = "Crypto"
-                elif t.startswith("KXHIGH") or t.startswith("KXLOW"):
-                    category = "Climate and Weather"
-                elif t.startswith("KXNBA") or t.startswith("KXNHL"):
-                    category = "Sports"
-                forced = _build_candidate_row_from_market(
-                    market=market,
-                    category=category,
-                    p_true=0.5,
-                    extra_notes="source=cli_tickers_override",
+                    print(
+                        f"[DEBUG] --tickers event-prefix expansion failed prefix={event_prefix} "
+                        f"error={exc}"
+                    )
+                    markets = []
+                if not markets:
+                    print(
+                        f"[DEBUG] --tickers event-prefix expansion produced no markets "
+                        f"prefix={event_prefix}"
+                    )
+                    continue
+                prefix_added = 0
+                for market in markets:
+                    if not isinstance(market, dict):
+                        continue
+                    ticker = str(market.get("ticker") or "").strip().upper()
+                    if not ticker or ticker in existing:
+                        continue
+                    classifier = ticker or event_prefix
+                    category = "Other"
+                    if classifier.startswith("KXBTC-") or classifier.startswith("KXETH-") or classifier.startswith("KXSOL"):
+                        category = "Crypto"
+                    elif classifier.startswith("KXHIGH") or classifier.startswith("KXLOW"):
+                        category = "Climate and Weather"
+                    elif classifier.startswith("KXNBA") or classifier.startswith("KXNHL"):
+                        category = "Sports"
+                    forced = _build_candidate_row_from_market(
+                        market=market,
+                        category=category,
+                        p_true=0.5,
+                        extra_notes="source=cli_tickers_override_event_prefix",
+                    )
+                    if forced is None:
+                        forced = {
+                            "strategy_id": "",
+                            "ticker": ticker,
+                            "event_ticker": str(market.get("event_ticker") or event_prefix),
+                            "title": str(market.get("title") or ""),
+                            "category": category,
+                            "close_time": "",
+                            "action": "post_yes",
+                            "maker_or_taker": "maker",
+                            "yes_price_cents": "50",
+                            "yes_bid": "",
+                            "yes_ask": "",
+                            "no_bid": "",
+                            "no_ask": "",
+                            "ev_dollars": "",
+                            "fees_assumed_dollars": "0.0",
+                            "slippage_assumed_dollars": "0.0",
+                            "rules_text_hash": "",
+                            "rules_pointer": "",
+                            "resolution_pointer": "",
+                            "liquidity_notes": "source=cli_tickers_override_event_prefix;p_true=0.500000",
+                            "p_true": "0.500000",
+                            "data_as_of_ts": _utc_now_iso(),
+                            "market_url": "",
+                        }
+                    out.append(forced)
+                    existing.add(ticker)
+                    force_count += 1
+                    prefix_added += 1
+                print(
+                    f"[DEBUG] Force-approved override prefix={event_prefix} "
+                    f"added_markets={prefix_added}"
                 )
-                if forced is None:
-                    forced = {
-                        "strategy_id": "",
-                        "ticker": t,
-                        "event_ticker": "",
-                        "title": "",
-                        "category": category,
-                        "close_time": "",
-                        "action": "post_yes",
-                        "maker_or_taker": "maker",
-                        "yes_price_cents": "50",
-                        "yes_bid": "",
-                        "yes_ask": "",
-                        "no_bid": "",
-                        "no_ask": "",
-                        "ev_dollars": "",
-                        "fees_assumed_dollars": "0.0",
-                        "slippage_assumed_dollars": "0.0",
-                        "rules_text_hash": "",
-                        "rules_pointer": "",
-                        "resolution_pointer": "",
-                        "liquidity_notes": "source=cli_tickers_override;p_true=0.500000",
-                        "p_true": "0.500000",
-                        "data_as_of_ts": _utc_now_iso(),
-                        "market_url": "",
-                    }
-                out.append(forced)
-                existing.add(t)
-                force_count += 1
-                print(f"[DEBUG] Force-approved override ticker={t}")
         print(f"[DEBUG] --tickers force-approve added={force_count} total={len(out)}")
 
     live_rows: List[Dict[str, str]] = []
@@ -2727,7 +2756,7 @@ def main() -> int:
                 ws_quotes = _ws_ticker_snapshot(
                     market_tickers=ws_sports_tickers,
                     use_private_auth=bool(cfg.get("sports_ws_use_private_auth", False)),
-                    timeout_s=float(cfg.get("sports_ws_timeout_seconds", 5.0)),
+                    timeout_s=float(cfg.get("sports_ws_timeout_seconds", 15.0)),
                 )
                 print(f"[SHADOW][WS] sports snapshot_tickers={len(ws_quotes)}")
                 for mt, msg in ws_quotes.items():

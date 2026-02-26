@@ -527,6 +527,15 @@ class CryptoSpecialist:
         maker_fee_rate = float(cfg.get("maker_fee_rate", 0.0))
         min_yes_bid_cents = int(cfg.get("min_yes_bid_cents", 1))
         max_yes_spread_cents = int(cfg.get("max_yes_spread_cents", 10))
+        shadow_mode = bool(str(cfg.get("shadow_execution_mode", "")).strip())
+        shadow_force_top_n = max(0, int(cfg.get("shadow_crypto_force_top_liquid_n", 5)))
+        shadow_force_enabled = str(cfg.get("shadow_crypto_force_top_liquid_enabled", "1")).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        shadow_force_liquidity_n = shadow_force_top_n if (shadow_mode and shadow_force_enabled) else 0
+        shadow_liquidity_pool: List[Tuple[Tuple[int, int, int], CandidateProposal]] = []
 
         granularity_s = int(cfg.get("crypto_granularity_s", 60))
         lookback_hours = float(cfg.get("crypto_lookback_hours", 24.0))
@@ -712,55 +721,88 @@ class CryptoSpecialist:
             fees = maker_fee_dollars(contracts=1, price=price, rate=maker_fee_rate)
             slippage = float(slippage_cents) / 100.0
             ev = float(p_fill) * (float(p_true) - price - fees - slippage)
-            if ev <= float(min_ev):
-                continue
 
             rules_pointer, rules_missing = rules_pointer_from_row(row)
-
-            out.append(
-                CandidateProposal(
-                    strategy_id="CRYPTO_gbm_price_bucket_maker" if model == "gbm_terminal" else "CRYPTO_gbm_touch_maker",
-                    ticker=ticker,
-                    title=str(row.get("title") or ""),
-                    category=category_from_row(row),
-                    close_time=str(row.get("close_time") or ""),
-                    event_ticker=event_ticker,
-                    side="yes",
-                    action="post_yes",
-                    maker_or_taker="maker",
-                    yes_price_cents=intended,
-                    no_price_cents=None,
-                    yes_bid=yes_bid,
-                    yes_ask=yes_ask,
-                    no_bid=safe_int(row.get("no_bid")),
-                    no_ask=safe_int(row.get("no_ask")),
-                    sum_prices_cents=None,
-                    p_fill_assumed=float(p_fill),
-                    fees_assumed_dollars=float(fees),
-                    slippage_assumed_dollars=float(slippage),
-                    ev_dollars=float(ev),
-                    ev_pct=(float(ev) / price if price > 0 else float("nan")),
-                    per_contract_notional=1.0,
-                    size_contracts=1,
-                    liquidity_notes=(
-                        f"p_true={p_true:.4f};model={model};product={product_id};spot={info.spot_price:.4f};"
-                        f"sigma_per_sqrt_s={info.sigma_per_sqrt_s:.10f};sigma_total={sigma_total:.6f};"
-                        f"horizon_s={horizon_s:.0f};effective_horizon_s={effective_horizon_s:.0f};"
-                        f"target_utc={target_dt.isoformat()};bounds={lower},{upper};"
-                        f"spot_sources={','.join(info.spot_sources) or 'coinbase_only'};"
-                        f"vol_source=coinbase_candles_{granularity_s}s"
-                    ),
-                    risk_flags=f"model=gbm;kind={model};product={product_id}",
-                    verification_checklist=(
-                        "verify settlement source (CF RTI) vs proxy; verify time window parse; "
-                        "verify bounds parse; verify volatility lookback/floor; verify maker fill/fee/slippage assumptions"
-                    ),
-                    rules_text_hash=rules_hash_from_row(row),
-                    rules_missing=rules_missing,
-                    rules_pointer=rules_pointer,
-                    resolution_pointer=resolution_pointer_from_row(row),
-                    market_url=str(row.get("market_url") or ""),
-                )
+            liquidity_notes = (
+                f"p_true={p_true:.4f};model={model};product={product_id};spot={info.spot_price:.4f};"
+                f"sigma_per_sqrt_s={info.sigma_per_sqrt_s:.10f};sigma_total={sigma_total:.6f};"
+                f"horizon_s={horizon_s:.0f};effective_horizon_s={effective_horizon_s:.0f};"
+                f"target_utc={target_dt.isoformat()};bounds={lower},{upper};"
+                f"spot_sources={','.join(info.spot_sources) or 'coinbase_only'};"
+                f"vol_source=coinbase_candles_{granularity_s}s"
             )
+
+            proposal = CandidateProposal(
+                strategy_id="CRYPTO_gbm_price_bucket_maker" if model == "gbm_terminal" else "CRYPTO_gbm_touch_maker",
+                ticker=ticker,
+                title=str(row.get("title") or ""),
+                category=category_from_row(row),
+                close_time=str(row.get("close_time") or ""),
+                event_ticker=event_ticker,
+                side="yes",
+                action="post_yes",
+                maker_or_taker="maker",
+                yes_price_cents=intended,
+                no_price_cents=None,
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+                no_bid=safe_int(row.get("no_bid")),
+                no_ask=safe_int(row.get("no_ask")),
+                sum_prices_cents=None,
+                p_fill_assumed=float(p_fill),
+                fees_assumed_dollars=float(fees),
+                slippage_assumed_dollars=float(slippage),
+                ev_dollars=float(ev),
+                ev_pct=(float(ev) / price if price > 0 else float("nan")),
+                per_contract_notional=1.0,
+                size_contracts=1,
+                liquidity_notes=liquidity_notes,
+                risk_flags=f"model=gbm;kind={model};product={product_id}",
+                verification_checklist=(
+                    "verify settlement source (CF RTI) vs proxy; verify time window parse; "
+                    "verify bounds parse; verify volatility lookback/floor; verify maker fill/fee/slippage assumptions"
+                ),
+                rules_text_hash=rules_hash_from_row(row),
+                rules_missing=rules_missing,
+                rules_pointer=rules_pointer,
+                resolution_pointer=resolution_pointer_from_row(row),
+                market_url=str(row.get("market_url") or ""),
+            )
+
+            if ev <= float(min_ev):
+                if shadow_force_liquidity_n > 0:
+                    spread = (int(yes_ask) - int(yes_bid)) if (yes_bid is not None and yes_ask is not None) else 999
+                    bid_size = safe_int(row.get("yes_bid_size"))
+                    if bid_size is None:
+                        bid_size = safe_int(row.get("yes_bid_size_fp"))
+                    liquidity_score = (
+                        max(0, int(bid_size or 0)),
+                        -max(0, int(spread)),
+                        max(0, int(yes_bid or 0)),
+                    )
+                    shadow_liquidity_pool.append((liquidity_score, proposal))
+                continue
+
+            out.append(proposal)
+
+        if shadow_force_liquidity_n > 0 and len(out) < int(shadow_force_liquidity_n):
+            seen = {str(p.ticker).strip().upper() for p in out}
+            needed = int(shadow_force_liquidity_n) - len(out)
+            added = 0
+            for _, proposal in sorted(shadow_liquidity_pool, key=lambda x: x[0], reverse=True):
+                t = str(proposal.ticker).strip().upper()
+                if not t or t in seen:
+                    continue
+                proposal.liquidity_notes = f"{proposal.liquidity_notes};shadow_liquidity_override=1"
+                out.append(proposal)
+                seen.add(t)
+                added += 1
+                if added >= needed:
+                    break
+            if added > 0:
+                print(
+                    f"[CRYPTO][SHADOW] liquidity override enabled added={added} "
+                    f"target_top_n={int(shadow_force_liquidity_n)} total={len(out)}"
+                )
 
         return out

@@ -1,1 +1,5 @@
 shadow_order_id,created_ts,strategy_id,ticker,event_ticker,category,side,action,maker_or_taker,intended_price_cents,assumed_fill_price_cents,size_contracts,fees_assumed_dollars,slippage_assumed_dollars,rules_text_hash,rules_pointer,resolution_pointer,status,resolved_ts,resolved_payout_dollars,realized_pnl_dollars,notes
+shadow-26FEB26-KXNBAGAME-26FEB26CHAIND,2026-02-26T20:54:53.886027+00:00,,KXNBAGAME-26FEB26CHAIND,,Sports,yes,post_yes,maker,50,,1,0.0,0.0,,,,open,,,,p_true=0.500000
+shadow-26FEB26-KXNBAGAME-26FEB26MIAPHI,2026-02-26T20:54:53.986055+00:00,,KXNBAGAME-26FEB26MIAPHI,,Sports,yes,post_yes,maker,50,,1,0.0,0.0,,,,open,,,,p_true=0.500000
+shadow-26FEB26-KXNHLGAME-26FEB26NYRWSH,2026-02-26T20:54:54.087868+00:00,,KXNHLGAME-26FEB26NYRWSH,,Sports,yes,post_yes,maker,50,,1,0.0,0.0,,,,open,,,,p_true=0.500000
+shadow-26FEB26-KXW-VIS-26FEB26,2026-02-26T20:54:54.191178+00:00,,KXW-VIS-26FEB26,,Other,yes,post_yes,maker,50,,1,0.0,0.0,,,,open,,,,p_true=0.500000
