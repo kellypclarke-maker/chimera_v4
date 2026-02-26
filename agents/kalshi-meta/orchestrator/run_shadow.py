@@ -69,7 +69,7 @@ from specialists.weather.plugin import (
     _resolve_station_context,
     _station_id_from_rules,
 )
-from specialists.nba.plugin import discover_nba_startup_tickers
+from specialists.nba.plugin import discover_nba_startup_tickers, lookup_nba_live_p_true
 from specialists.nhl.plugin import discover_nhl_startup_tickers
 
 from specialists.crypto.plugin import (
@@ -1571,14 +1571,28 @@ def _evaluate_sports_edge(
     market: Dict[str, Any],
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    p_true = _p_true_from_order(order)
+    strategy = str(order.get("strategy_id") or "").strip().upper()
+    ticker = str(order.get("ticker") or "").strip().upper()
+    event_ticker = str(order.get("event_ticker") or market.get("event_ticker") or "").strip().upper()
+    title = str(market.get("title") or order.get("title") or "").strip()
+
+    if strategy.startswith("NBA_") or ticker.startswith("KXNBA"):
+        live_nba = lookup_nba_live_p_true(
+            ticker=ticker,
+            event_ticker=event_ticker,
+            title=title,
+            config=config,
+        )
+        if live_nba is None:
+            return {"ok": False, "reason": "nba_live_odds_missing"}
+        p_true = float(live_nba)
+    else:
+        p_true = _p_true_from_order(order)
     if p_true is None:
         return {"ok": False, "reason": "sports_p_true_missing"}
 
     yes_bid = safe_int(market.get("yes_bid"))
     yes_ask = safe_int(market.get("yes_ask"))
-    strategy = str(order.get("strategy_id") or "").strip().upper()
-    ticker = str(order.get("ticker") or "").strip().upper()
 
     if strategy.startswith("NBA_") or ticker.startswith("KXNBA"):
         join_ticks_key = "nba_join_ticks"
@@ -2111,7 +2125,11 @@ def _update_open_order_lifecycle(
     order["fees_assumed_dollars"] = f"{float(eval_out.get('fees_dollars') or 0.0):.6f}"
     order["slippage_assumed_dollars"] = f"{float(eval_out.get('slippage_dollars') or 0.0):.6f}"
     order["_runtime_last_ev"] = f"{ev:.6f}"
-    order["_runtime_last_p_true"] = f"{float(eval_out.get('p_true') or 0.0):.6f}"
+    new_p_true = float(eval_out.get("p_true") or 0.0)
+    old_p_true = _parse_float(order.get("_runtime_last_p_true"))
+    if model == "sports" and (old_p_true is None or abs(float(old_p_true) - float(new_p_true)) > 1e-9):
+        print(f"[SHADOW][ORACLE] Updated p_true for {ticker}: {new_p_true:.6f}")
+    order["_runtime_last_p_true"] = f"{new_p_true:.6f}"
     order["_runtime_last_p_fill"] = f"{float(eval_out.get('p_fill') or 0.0):.6f}"
     order["_runtime_last_mu"] = f"{float(eval_out.get('mu') or 0.0):.6f}"
     order["_runtime_last_sigma"] = f"{float(eval_out.get('sigma') or 0.0):.6f}"

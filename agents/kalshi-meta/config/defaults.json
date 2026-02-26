@@ -44,6 +44,7 @@
   "nba_join_ticks": 1,
   "nba_slippage_cents_per_contract": 0.25,
   "nba_min_ev_dollars": 0.0,
+  "nba_odds_poll_seconds": 600.0,
   "nhl_join_ticks": 1,
   "nhl_slippage_cents_per_contract": 0.25,
   "nhl_min_ev_dollars": 0.0,

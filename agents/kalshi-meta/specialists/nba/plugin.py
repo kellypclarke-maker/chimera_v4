@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
-from typing import Dict, List, Optional
+import time
+from typing import Dict, FrozenSet, List, Optional, Tuple
 
 import requests
 
@@ -24,6 +26,218 @@ from specialists.helpers import (
 
 _P_TRUE_RE = re.compile(r"\bp_true(?:_cal)?=([0-9]*\.?[0-9]+)")
 _NBA_TEAMS = ("CHA", "IND", "MIA", "PHI")
+_NBA_EVENT_RE = re.compile(r"^KXNBAGAME-(?P<date>\d{2}[A-Z]{3}\d{2})(?P<pair>[A-Z]{6})(?:-(?P<side>[A-Z]{3}))?$")
+
+_NBA_TEAM_CODE_TO_NAME: Dict[str, str] = {
+    "CHA": "Charlotte Hornets",
+    "IND": "Indiana Pacers",
+    "MIA": "Miami Heat",
+    "PHI": "Philadelphia 76ers",
+}
+
+_NBA_TEAM_ALIASES: Dict[str, str] = {
+    "charlotte hornets": "Charlotte Hornets",
+    "indiana pacers": "Indiana Pacers",
+    "miami heat": "Miami Heat",
+    "philadelphia 76ers": "Philadelphia 76ers",
+    "philadelphia seventy sixers": "Philadelphia 76ers",
+    "76ers": "Philadelphia 76ers",
+}
+
+_ODDS_BASE_URL = "https://api.the-odds-api.com/v4"
+_ODDS_SPORT_KEY = "basketball_nba"
+_ODDS_MARKET = "h2h"
+_ODDS_MIN_POLL_SECONDS = 600.0  # Free-tier guard: no faster than every 10 minutes.
+
+_ODDS_CACHE_LAST_FETCH_MONO = 0.0
+_ODDS_CACHE_PAIR_PROBS: Dict[FrozenSet[str], Dict[str, float]] = {}
+_ODDS_CACHE_LOGGED_KEY_STATE = False
+
+
+def _normalize_team_name(name: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", " ", str(name or "").strip().lower()).strip()
+    if not s:
+        return ""
+    return _NBA_TEAM_ALIASES.get(s, "")
+
+
+def _parse_nba_ticker_codes(*, ticker: str, event_ticker: str) -> Optional[Tuple[str, str, str, Optional[str]]]:
+    t = str(ticker or "").strip().upper()
+    ev = str(event_ticker or "").strip().upper()
+    m = _NBA_EVENT_RE.match(t) or _NBA_EVENT_RE.match(ev)
+    if not m:
+        return None
+    date_token = str(m.group("date") or "").strip().upper()
+    pair = str(m.group("pair") or "").strip().upper()
+    if len(pair) != 6:
+        return None
+    team_a = pair[:3]
+    team_b = pair[3:]
+    side = str(m.group("side") or "").strip().upper() or None
+    if side is None:
+        mt = _NBA_EVENT_RE.match(t)
+        if mt:
+            side = str(mt.group("side") or "").strip().upper() or None
+    return (date_token, team_a, team_b, side)
+
+
+def _odds_api_key(config: Dict[str, object]) -> str:
+    return str(
+        os.environ.get("THE_ODDS_API_KEY")
+        or config.get("THE_ODDS_API_KEY")
+        or ""
+    ).strip()
+
+
+def _odds_poll_seconds(config: Dict[str, object]) -> float:
+    raw = config.get("nba_odds_poll_seconds", _ODDS_MIN_POLL_SECONDS)
+    try:
+        return max(_ODDS_MIN_POLL_SECONDS, float(raw))
+    except Exception:
+        return _ODDS_MIN_POLL_SECONDS
+
+
+def _extract_bookmaker_h2h_probs(bookmaker: Dict[str, object]) -> Optional[Dict[str, float]]:
+    markets = bookmaker.get("markets")
+    if not isinstance(markets, list):
+        return None
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        if str(market.get("key") or "").strip().lower() != _ODDS_MARKET:
+            continue
+        outcomes = market.get("outcomes")
+        if not isinstance(outcomes, list):
+            continue
+        implied: Dict[str, float] = {}
+        for outcome in outcomes:
+            if not isinstance(outcome, dict):
+                continue
+            team_name = _normalize_team_name(str(outcome.get("name") or ""))
+            if not team_name:
+                continue
+            try:
+                price = float(outcome.get("price"))
+            except Exception:
+                continue
+            if price <= 1.0:
+                continue
+            implied[team_name] = 1.0 / price
+        if len(implied) < 2:
+            continue
+        total = sum(float(v) for v in implied.values())
+        if total <= 0.0:
+            continue
+        return {k: float(v) / total for k, v in implied.items()}
+    return None
+
+
+def _refresh_odds_pair_probabilities(config: Dict[str, object]) -> Dict[FrozenSet[str], Dict[str, float]]:
+    global _ODDS_CACHE_LAST_FETCH_MONO, _ODDS_CACHE_PAIR_PROBS, _ODDS_CACHE_LOGGED_KEY_STATE
+
+    api_key = _odds_api_key(config)
+    if not _ODDS_CACHE_LOGGED_KEY_STATE:
+        print(f"[SHADOW][ORACLE] NBA Odds API key present={bool(api_key)}")
+        _ODDS_CACHE_LOGGED_KEY_STATE = True
+    if not api_key:
+        return dict(_ODDS_CACHE_PAIR_PROBS)
+
+    now_mono = time.monotonic()
+    poll_s = _odds_poll_seconds(config)
+    if _ODDS_CACHE_PAIR_PROBS and (now_mono - float(_ODDS_CACHE_LAST_FETCH_MONO)) < float(poll_s):
+        return dict(_ODDS_CACHE_PAIR_PROBS)
+
+    url = f"{_ODDS_BASE_URL}/sports/{_ODDS_SPORT_KEY}/odds"
+    params = {
+        "apiKey": api_key,
+        "regions": "us",
+        "markets": _ODDS_MARKET,
+        "oddsFormat": "decimal",
+        "dateFormat": "iso",
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=20.0)
+        resp.raise_for_status()
+        payload = resp.json() if resp.content else []
+    except Exception as exc:
+        print(f"[SHADOW][ORACLE] Odds API fetch failed: {exc}")
+        return dict(_ODDS_CACHE_PAIR_PROBS)
+
+    if not isinstance(payload, list):
+        print("[SHADOW][ORACLE] Odds API payload invalid (expected list)")
+        return dict(_ODDS_CACHE_PAIR_PROBS)
+
+    pair_probs: Dict[FrozenSet[str], Dict[str, float]] = {}
+    for game in payload:
+        if not isinstance(game, dict):
+            continue
+        home = _normalize_team_name(str(game.get("home_team") or ""))
+        away = _normalize_team_name(str(game.get("away_team") or ""))
+        if not home or not away or home == away:
+            continue
+        bookmakers = game.get("bookmakers")
+        if not isinstance(bookmakers, list):
+            continue
+        by_team: Dict[str, List[float]] = {}
+        for bookmaker in bookmakers:
+            if not isinstance(bookmaker, dict):
+                continue
+            probs = _extract_bookmaker_h2h_probs(bookmaker)
+            if not probs:
+                continue
+            for team_name, p in probs.items():
+                by_team.setdefault(team_name, []).append(float(p))
+        if len(by_team) < 2:
+            continue
+        averaged = {team_name: (sum(vals) / len(vals)) for team_name, vals in by_team.items() if vals}
+        total = sum(float(v) for v in averaged.values())
+        if total <= 0.0:
+            continue
+        normalized = {team_name: float(v) / total for team_name, v in averaged.items()}
+        key = frozenset(normalized.keys())
+        if len(key) == 2:
+            pair_probs[key] = normalized
+
+    _ODDS_CACHE_LAST_FETCH_MONO = now_mono
+    _ODDS_CACHE_PAIR_PROBS = pair_probs
+    print(f"[SHADOW][ORACLE] NBA odds refresh pairs={len(pair_probs)} poll_s={int(poll_s)}")
+    return dict(_ODDS_CACHE_PAIR_PROBS)
+
+
+def lookup_nba_live_p_true(
+    *,
+    ticker: str,
+    event_ticker: str,
+    title: str,
+    config: Dict[str, object],
+) -> Optional[float]:
+    parsed = _parse_nba_ticker_codes(ticker=ticker, event_ticker=event_ticker)
+    if parsed is None:
+        return None
+    _, team_a_code, team_b_code, side_code = parsed
+    team_a = _NBA_TEAM_CODE_TO_NAME.get(team_a_code)
+    team_b = _NBA_TEAM_CODE_TO_NAME.get(team_b_code)
+    if not team_a or not team_b:
+        return None
+
+    selected_team = _NBA_TEAM_CODE_TO_NAME.get(str(side_code or "").strip().upper())
+    if not selected_team:
+        title_norm = _normalize_team_name(title)
+        if title_norm in {team_a, team_b}:
+            selected_team = title_norm
+    if not selected_team:
+        return None
+
+    pair_probs = _refresh_odds_pair_probabilities(config)
+    game_probs = pair_probs.get(frozenset({team_a, team_b}))
+    if not game_probs:
+        return None
+    p_true = game_probs.get(selected_team)
+    if p_true is None:
+        return None
+    if not (0.0 <= float(p_true) <= 1.0):
+        return None
+    return float(p_true)
 
 
 def _safe_float(raw: object) -> Optional[float]:
@@ -110,7 +324,13 @@ class NBASpecialist:
         for row in context.markets:
             if not _is_nba_row(row):
                 continue
-            p_true = _extract_p_true(row)
+            live_p_true = lookup_nba_live_p_true(
+                ticker=str(row.get("ticker") or ""),
+                event_ticker=str(row.get("event_ticker") or ""),
+                title=str(row.get("title") or ""),
+                config=cfg,
+            )
+            p_true = live_p_true
             if p_true is None:
                 continue
 
@@ -161,7 +381,7 @@ class NBASpecialist:
                     ev_pct=(float(ev) / price if price > 0 else 0.0),
                     per_contract_notional=1.0,
                     size_contracts=1,
-                    liquidity_notes=f"p_true={p_true:.6f};sport=nba",
+                    liquidity_notes=f"p_true={p_true:.6f};sport=nba;source=odds_api",
                     risk_flags="sport=nba",
                     verification_checklist="verify sportsbook/live model p_true and final injury/news state before live usage",
                     rules_text_hash=rules_hash_from_row(row),
