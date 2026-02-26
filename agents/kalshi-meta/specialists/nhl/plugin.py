@@ -144,9 +144,13 @@ def _parse_nhl_ticker_codes(*, ticker: str, event_ticker: str) -> Optional[Tuple
 def _odds_api_key(config: Dict[str, object]) -> str:
     return (
         str(
-        os.environ.get("THE_ODDS_API_KEY")
-        or config.get("THE_ODDS_API_KEY")
-        or ""
+            os.environ.get("THE_ODDS_API_KEY_20k")
+            or os.environ.get("THE_ODDS_API_KEY_20K")
+            or config.get("THE_ODDS_API_KEY_20k")
+            or config.get("THE_ODDS_API_KEY_20K")
+            or os.environ.get("THE_ODDS_API_KEY")
+            or config.get("THE_ODDS_API_KEY")
+            or ""
         )
         .strip()
         .replace('"', "")
