@@ -703,6 +703,19 @@ def _parse_ticker_override(raw: str) -> List[str]:
     return [t.strip().upper() for t in str(raw or "").split(",") if t.strip()]
 
 
+def _sorted_with_priority_prefix(
+    tickers: Iterable[str],
+    *,
+    priority_prefix: str,
+    priority_active: bool,
+) -> List[str]:
+    pref = str(priority_prefix or "").strip().upper()
+    items = sorted({str(t).strip().upper() for t in tickers if str(t).strip()})
+    if not pref or not priority_active:
+        return items
+    return sorted(items, key=lambda t: (0 if t.startswith(pref) else 1, t))
+
+
 def _load_queue_tickers_from_md(path: Path) -> List[str]:
     if not path.exists():
         return []
@@ -2748,6 +2761,9 @@ def main() -> int:
     start_monotonic = time.monotonic()
     cycle = 0
     last_empty_discovery_attempt = 0.0
+    btc_priority_window_s = 15.0 * 60.0
+    day_token = _kalshi_date_token_from_iso(day) or str(day).strip().upper()
+    btc_priority_prefix = f"KXBTC-{day_token}17"
 
     while True:
         cycle += 1
@@ -2786,6 +2802,7 @@ def main() -> int:
         open_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
         needed_market_tickers: set[str] = set()
         open_sports_tickers: set[str] = set()
+        priority_active = (time.monotonic() - start_monotonic) <= btc_priority_window_s
         resolution_lookahead_minutes = float(cfg.get("shadow_resolution_lookahead_minutes", 0.0))
         resolution_cutoff = _utc_now() + dt.timedelta(minutes=float(resolution_lookahead_minutes))
         for o in orders:
@@ -2806,11 +2823,30 @@ def main() -> int:
             f"[SHADOW][HEARTBEAT] needed_market_tickers={len(needed_market_tickers)} "
             f"open_tickers={len(open_by_ticker)} open_sports={len(open_sports_tickers)}"
         )
+        if priority_active:
+            btc_needed = sum(1 for t in needed_market_tickers if str(t).startswith(btc_priority_prefix))
+            if btc_needed > 0:
+                print(
+                    f"[SHADOW][PRIORITY] btc_priority_prefix={btc_priority_prefix} "
+                    f"active_window_s={int(btc_priority_window_s)} needed={btc_needed}"
+                )
+
+        ordered_open_tickers = _sorted_with_priority_prefix(
+            open_by_ticker.keys(),
+            priority_prefix=btc_priority_prefix,
+            priority_active=priority_active,
+        )
+        ordered_needed_tickers = _sorted_with_priority_prefix(
+            needed_market_tickers,
+            priority_prefix=btc_priority_prefix,
+            priority_active=priority_active,
+        )
 
         market_cache: Dict[str, Dict[str, Any]] = {}
         with requests.Session() as s:
             # Fill detection first, against current active quote state.
-            for ticker, ticker_orders in open_by_ticker.items():
+            for ticker in ordered_open_tickers:
+                ticker_orders = open_by_ticker.get(ticker, [])
                 maker_orders = [
                     o
                     for o in ticker_orders
@@ -2846,6 +2882,7 @@ def main() -> int:
                 f"[SHADOW][WS] sports_ws_enabled={sports_ws_enabled} "
                 f"open_sports_tickers={len(ws_sports_tickers)}"
             )
+            ws_received_sports: set[str] = set()
             if sports_ws_enabled and ws_sports_tickers:
                 key_id_present = bool(str(os.environ.get("KALSHI_API_KEY_ID") or "").strip())
                 private_key_present = bool(
@@ -2870,6 +2907,7 @@ def main() -> int:
                     if not isinstance(msg, dict):
                         continue
                     ticker = str(mt).strip().upper()
+                    ws_received_sports.add(ticker)
                     market_cache[ticker] = {
                         "ticker": ticker,
                         "yes_bid": safe_int(msg.get("yes_bid")),
@@ -2881,7 +2919,23 @@ def main() -> int:
             elif not ws_sports_tickers:
                 print("[SHADOW][WS] skipped sports snapshot (no open sports orders)")
 
-            for ticker in sorted(needed_market_tickers):
+            if sports_ws_enabled and ws_sports_tickers:
+                for ticker in ws_sports_tickers:
+                    t = str(ticker).strip().upper()
+                    if not t:
+                        continue
+                    if t not in ws_received_sports:
+                        try:
+                            market_cache[t] = _fetch_market(session=s, base_url=base_url, ticker=t)
+                            print(
+                                f"[SHADOW][WS] REST fallback for ws-miss ticker={t} "
+                                f"yes_bid={safe_int(market_cache[t].get('yes_bid'))} "
+                                f"yes_ask={safe_int(market_cache[t].get('yes_ask'))}"
+                            )
+                        except Exception as exc:
+                            print(f"[SHADOW][WS] REST fallback failed for ws-miss ticker={t} error={exc}")
+
+            for ticker in ordered_needed_tickers:
                 if ticker in market_cache:
                     continue
                 try:
@@ -2898,6 +2952,22 @@ def main() -> int:
             ticker = str(order.get("ticker") or "").strip().upper()
             market = market_cache.get(ticker)
             if not isinstance(market, dict):
+                strategy_id = str(order.get("strategy_id") or "").strip()
+                is_override_sports = bool(
+                    _is_sports_order(order)
+                    and tickers_override
+                    and any(
+                        ticker.startswith(str(prefix).strip().upper()) or str(prefix).strip().upper() in ticker
+                        for prefix in tickers_override
+                        if str(prefix).strip()
+                    )
+                )
+                if is_override_sports:
+                    print(
+                        f"[SHADOW][EVAL] ticker={ticker} category=Sports strategy={strategy_id or 'NA'} "
+                        "yes_bid=None yes_ask=None"
+                    )
+                    print(f"[SHADOW][EVAL] ticker={ticker} skipped reason=market_missing")
                 continue
             _update_open_order_lifecycle(
                 order=order,
