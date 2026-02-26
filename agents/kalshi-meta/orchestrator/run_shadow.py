@@ -820,6 +820,8 @@ def _load_daily_candidates(path: Path) -> Dict[str, Dict[str, str]]:
     with path.open("r", newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             t = str(row.get("ticker") or "").strip().upper()
+            if t.startswith("KXNBAGAME") or t.startswith("KXNHLGAME"):
+                row["category"] = "Sports"
             if t and t not in out:
                 out[t] = row
     return out
@@ -1053,7 +1055,12 @@ def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], co
             for event_prefix in sorted({str(x).strip().upper() for x in tickers_override if str(x).strip()}):
                 if _is_direct_market_override_ticker(event_prefix):
                     ticker = event_prefix
-                    if ticker not in existing:
+                    if ticker in existing:
+                        for row in out:
+                            if str(row.get("ticker") or "").strip().upper() == ticker:
+                                row["category"] = "Sports"
+                                break
+                    else:
                         event_ticker = ticker.rsplit("-", 1)[0]
                         category = "Sports"
                         forced = _build_candidate_row_from_market(
@@ -1275,6 +1282,8 @@ def _migrate_order(order: Dict[str, Any], day: str) -> Dict[str, Any]:
     out.setdefault("ticker", ticker)
     out.setdefault("event_ticker", str(out.get("event_ticker") or ""))
     out.setdefault("category", str(out.get("category") or ""))
+    if (not str(out.get("category") or "").strip()) and (ticker.startswith("KXNBAGAME") or ticker.startswith("KXNHLGAME")):
+        out["category"] = "Sports"
     out.setdefault("side", "yes")
     out.setdefault("action", "post_yes")
     out.setdefault("maker_or_taker", "maker")
