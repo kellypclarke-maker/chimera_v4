@@ -89,6 +89,7 @@ from specialists.crypto.plugin import (
 DEFAULT_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 _KALSHI_MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 _DATE_TOKEN_FULL_RE = re.compile(r"^\d{2}[A-Z]{3}\d{2}$")
+_SPORTS_EVENT_PREFIXES: Tuple[str, ...] = ("KXNBAGAME-", "KXNHLGAME-")
 
 
 def log_shadow_trade(
@@ -182,6 +183,73 @@ def _spot_from_candidate_row(row: Dict[str, str]) -> Optional[float]:
 def _is_sports_ticker(ticker: str) -> bool:
     t = str(ticker or "").strip().upper()
     return t.startswith("KXNBA") or t.startswith("KXNHL")
+
+
+def _is_parent_sports_event_ticker(ticker: str) -> bool:
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return False
+    if not any(t.startswith(prefix) for prefix in _SPORTS_EVENT_PREFIXES):
+        return False
+    return t.count("-") == 1
+
+
+def _is_specific_sports_market_ticker(ticker: str) -> bool:
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return False
+    if not any(t.startswith(prefix) for prefix in _SPORTS_EVENT_PREFIXES):
+        return False
+    return t.count("-") >= 2
+
+
+def _expand_parent_sports_event_to_market_tickers(
+    *,
+    session: requests.Session,
+    base_url: str,
+    parent_event_ticker: str,
+) -> List[str]:
+    parent = str(parent_event_ticker or "").strip().upper()
+    if not _is_parent_sports_event_ticker(parent):
+        return []
+    try:
+        markets = fetch_public_markets(
+            session=session,
+            event_tickers=[parent],
+            base_url=base_url,
+            max_events=1,
+        )
+    except Exception as exc:
+        print(f"[SHADOW][DISCOVERY] event->market expansion failed event_ticker={parent} error={exc}")
+        return []
+
+    out: set[str] = set()
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        mt = str(market.get("ticker") or "").strip().upper()
+        if not mt:
+            continue
+        if _is_specific_sports_market_ticker(mt) and mt.startswith(parent + "-"):
+            out.add(mt)
+
+    if not out:
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            mt = str(market.get("ticker") or "").strip().upper()
+            if mt and _is_specific_sports_market_ticker(mt):
+                out.add(mt)
+
+    resolved = sorted(out)
+    if resolved:
+        print(
+            f"[SHADOW][DISCOVERY] flattened event_ticker={parent} "
+            f"market_count={len(resolved)} first3={resolved[:3]}"
+        )
+    else:
+        print(f"[SHADOW][DISCOVERY] flattened event_ticker={parent} market_count=0")
+    return resolved
 
 
 def _is_sports_order(order: Dict[str, Any]) -> bool:
@@ -752,6 +820,28 @@ def _ticker_matches_date_token(*, ticker: str, date_token: str) -> bool:
     return tok in t
 
 
+def _prune_parent_sports_event_candidate_rows(rows: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    children_by_parent: set[str] = set()
+    for row in rows:
+        ticker = str(row.get("ticker") or "").strip().upper()
+        if _is_specific_sports_market_ticker(ticker):
+            children_by_parent.add(ticker.rsplit("-", 1)[0])
+    if not children_by_parent:
+        return list(rows)
+
+    out: List[Dict[str, str]] = []
+    dropped = 0
+    for row in rows:
+        ticker = str(row.get("ticker") or "").strip().upper()
+        if _is_parent_sports_event_ticker(ticker) and ticker in children_by_parent:
+            dropped += 1
+            continue
+        out.append(row)
+    if dropped > 0:
+        print(f"[SHADOW][DISCOVERY] pruned parent sports event rows={dropped}")
+    return out
+
+
 def _debug_preview_event_tickers_from_api(*, day: str, config: Dict[str, Any]) -> None:
     base_url = str(config.get("base_url") or DEFAULT_BASE).strip().rstrip("/") or DEFAULT_BASE
     series: List[str] = []
@@ -1050,6 +1140,7 @@ def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], co
             f"live_candidates={len(live_rows)} merged={len(out)}"
         )
     out = _filter_candidates_with_dynamic_crypto_discovery(candidates=out, day=day, config=cfg)
+    out = _prune_parent_sports_event_candidate_rows(out)
     n_crypto = sum(1 for r in out if str(r.get("category") or "").strip().lower() == "crypto")
     n_weather = sum(1 for r in out if str(r.get("category") or "").strip().lower() == "climate and weather")
     n_sports = sum(1 for r in out if str(r.get("category") or "").strip().lower() == "sports")
@@ -1613,8 +1704,9 @@ def _evaluate_sports_edge(
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
     strategy = str(order.get("strategy_id") or "").strip().upper()
-    ticker = str(order.get("ticker") or "").strip().upper()
-    event_ticker = str(order.get("event_ticker") or market.get("event_ticker") or "").strip().upper()
+    order_ticker = str(order.get("ticker") or "").strip().upper()
+    ticker = str(market.get("ticker") or order_ticker).strip().upper()
+    event_ticker = str(market.get("event_ticker") or order.get("event_ticker") or "").strip().upper()
     title = str(market.get("title") or order.get("title") or "").strip()
 
     if strategy.startswith("NBA_") or ticker.startswith("KXNBA"):
@@ -2117,7 +2209,10 @@ def _update_open_order_lifecycle(
     now_iso = _utc_now_iso()
     category = str(order.get("category") or "").strip()
     strategy_id = str(order.get("strategy_id") or "").strip()
-    ticker = str(order.get("ticker") or "").strip().upper()
+    order_ticker = str(order.get("ticker") or "").strip().upper()
+    ticker = str(market.get("ticker") or order_ticker).strip().upper()
+    if ticker:
+        order["_runtime_market_ticker"] = ticker
     yes_bid = safe_int(market.get("yes_bid"))
     yes_ask = safe_int(market.get("yes_ask"))
     print(
@@ -2798,6 +2893,26 @@ def main() -> int:
                 else:
                     print("[SHADOW][DISCOVERY] rediscovery found 0 candidates")
 
+        parent_sports_event_tickers = sorted(
+            {
+                str(o.get("ticker") or "").strip().upper()
+                for o in orders
+                if str(o.get("status") or "").strip().lower() in {"open", "filled"}
+                and _is_parent_sports_event_ticker(str(o.get("ticker") or ""))
+            }
+        )
+        parent_sports_event_markets: Dict[str, List[str]] = {}
+        if parent_sports_event_tickers:
+            with requests.Session() as expand_session:
+                for parent_event_ticker in parent_sports_event_tickers:
+                    expanded_markets = _expand_parent_sports_event_to_market_tickers(
+                        session=expand_session,
+                        base_url=base_url,
+                        parent_event_ticker=parent_event_ticker,
+                    )
+                    if expanded_markets:
+                        parent_sports_event_markets[parent_event_ticker] = expanded_markets
+
         open_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
         needed_market_tickers: set[str] = set()
         open_sports_tickers: set[str] = set()
@@ -2809,15 +2924,29 @@ def main() -> int:
             if not ticker:
                 continue
             status = str(o.get("status") or "").strip().lower()
+            runtime_ticker = ticker
+            if _is_parent_sports_event_ticker(ticker):
+                expanded = parent_sports_event_markets.get(ticker, [])
+                runtime_ticker = (expanded[0] if expanded else "")
+                if not runtime_ticker:
+                    print(f"[SHADOW][DISCOVERY] unresolved parent event ticker={ticker} (no child market ticker)")
+
+            prev_runtime_ticker = str(o.get("_runtime_market_ticker") or "").strip().upper()
+            o["_runtime_market_ticker"] = runtime_ticker
+            if runtime_ticker and prev_runtime_ticker != runtime_ticker:
+                print(f"[SHADOW][DISCOVERY] order ticker remap order={ticker} runtime_market={runtime_ticker}")
+            if not runtime_ticker:
+                continue
+
             if status == "open":
-                needed_market_tickers.add(ticker)
-                open_by_ticker.setdefault(ticker, []).append(o)
+                needed_market_tickers.add(runtime_ticker)
+                open_by_ticker.setdefault(runtime_ticker, []).append(o)
                 if _is_sports_order(o):
-                    open_sports_tickers.add(ticker)
+                    open_sports_tickers.add(runtime_ticker)
             elif status == "filled":
                 close_ts = _parse_ts(o.get("close_time"))
                 if close_ts is not None and close_ts <= resolution_cutoff:
-                    needed_market_tickers.add(ticker)
+                    needed_market_tickers.add(runtime_ticker)
         print(
             f"[SHADOW][HEARTBEAT] needed_market_tickers={len(needed_market_tickers)} "
             f"open_tickers={len(open_by_ticker)} open_sports={len(open_sports_tickers)}"
@@ -2974,21 +3103,25 @@ def main() -> int:
             if str(order.get("status") or "") != "open":
                 continue
             ticker = str(order.get("ticker") or "").strip().upper()
-            market = market_cache.get(ticker)
+            market_lookup_ticker = str(order.get("_runtime_market_ticker") or ticker).strip().upper()
+            market = market_cache.get(market_lookup_ticker)
             if not isinstance(market, dict):
                 strategy_id = str(order.get("strategy_id") or "").strip()
                 is_override_sports = bool(
                     _is_sports_order(order)
                     and tickers_override
                     and any(
-                        ticker.startswith(str(prefix).strip().upper()) or str(prefix).strip().upper() in ticker
+                        market_lookup_ticker.startswith(str(prefix).strip().upper())
+                        or str(prefix).strip().upper() in market_lookup_ticker
+                        or ticker.startswith(str(prefix).strip().upper())
+                        or str(prefix).strip().upper() in ticker
                         for prefix in tickers_override
                         if str(prefix).strip()
                     )
                 )
                 if is_override_sports:
                     synthetic_market = {
-                        "ticker": ticker,
+                        "ticker": (market_lookup_ticker or ticker),
                         "event_ticker": str(order.get("event_ticker") or "").strip().upper(),
                         "title": str(order.get("title") or ""),
                         "yes_bid": safe_int(order.get("yes_bid")),
@@ -2998,7 +3131,7 @@ def main() -> int:
                         "status": "open",
                     }
                     print(
-                        f"[SHADOW][WS] synthetic sports market fallback ticker={ticker} "
+                        f"[SHADOW][WS] synthetic sports market fallback ticker={(market_lookup_ticker or ticker)} "
                         f"strategy={strategy_id or 'NA'}"
                     )
                     _update_open_order_lifecycle(
