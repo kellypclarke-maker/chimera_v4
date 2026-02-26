@@ -576,13 +576,40 @@ def _load_config(path: Path) -> Dict[str, Any]:
 
 
 def _load_env_list_defaults(path: Path) -> None:
-    if not path.exists():
+    candidates: List[Path] = []
+    raw = Path(str(path)).expanduser()
+    candidates.append(raw)
+    try:
+        candidates.append(raw.resolve())
+    except Exception:
+        pass
+    candidates.append(REPO_ROOT / "env.list")
+    candidates.append(ROOT / "env.list")
+    candidates.append(Path.cwd() / "env.list")
+
+    seen: set[str] = set()
+    env_path: Optional[Path] = None
+    for cand in candidates:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        if cand.exists():
+            env_path = cand
+            break
+
+    if env_path is None:
+        print(f"[DEBUG] Env defaults file not found. checked={list(seen)}")
         return
+
     loaded = 0
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = str(raw or "").strip()
+    parsed = 0
+    for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = str(raw_line or "").strip()
         if not line or line.startswith("#"):
             continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
         if "=" not in line:
             continue
         k, v = line.split("=", 1)
@@ -590,10 +617,12 @@ def _load_env_list_defaults(path: Path) -> None:
         if not key:
             continue
         value = str(v or "").strip().strip('"').strip("'")
-        if key not in os.environ or not str(os.environ.get(key) or "").strip():
+        parsed += 1
+        print(f"[DEBUG] Found potential key: {key} (length: {len(value)})")
+        if not str(os.environ.get(key) or "").strip():
             os.environ[key] = value
             loaded += 1
-    print(f"[DEBUG] Env defaults loaded from {path} keys={loaded}")
+    print(f"[DEBUG] Env defaults loaded from {env_path} parsed={parsed} set={loaded}")
 
 
 def _as_bool(value: Any, *, default: bool = False) -> bool:
