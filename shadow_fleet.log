@@ -1,0 +1,141 @@
+Starting 4-Market Shadow Oracles (NBA, NHL, Crypto, Weather)...
+Starting Exchange Listener (Stream B)...
+[Weather Oracle] Unexpected NOAA response: 400
+[Exchange] Non-ticker message received: subscribed
+[Crypto Oracle] Connected to Binance WS: btcusdt
+[SHADOW] BUY YES order placed: shadow-1772074940 for KXNHLGAME-26FEB25VGKLA-VGK at 38c x 1
+[OK] Placed order for KXNHLGAME-26FEB25VGKLA-VGK at 38c
+[SHADOW] BUY YES order placed: shadow-1772074940 for KXNBAGAME-26FEB25OKCDET-OKC at 1c x 1
+[OK] Placed order for KXNBAGAME-26FEB25OKCDET-OKC at 1c
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Crypto Oracle] WebSocket disconnected or error: no close frame received or sent
+[Crypto Oracle] Connected to Binance WS: btcusdt
+[Exchange Listener] WS read timeout (1/3); continuing to wait...
+[Weather Oracle] Unexpected NOAA response: 400
+[Exchange Listener] WS read timeout (2/3); continuing to wait...
+[Exchange Listener] 3 consecutive timeouts; breaking to reconnect...
+[Exchange] Non-ticker message received: subscribed
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Weather Oracle] Unexpected NOAA response: 400
+[Exchange Listener] WS read timeout (1/3); continuing to wait...
+[Exchange Listener] WS read timeout (2/3); continuing to wait...
+[Weather Oracle] Unexpected NOAA response: 400
+[Exchange Listener] 3 consecutive timeouts; breaking to reconnect...
+[Exchange] Non-ticker message received: subscribed
+[Exchange Listener] WS read timeout (1/3); continuing to wait...
+[Weather Oracle] Unexpected NOAA response: 400
+[Exchange Listener] WS read timeout (2/3); continuing to wait...
+[Exchange Listener] 3 consecutive timeouts; breaking to reconnect...
+[Exchange] Non-ticker message received: subscribed
+[Weather Oracle] Unexpected NOAA response: 400
+[Exchange Listener] WS read timeout (1/3); continuing to wait...
+[Exchange Listener] WS read timeout (2/3); continuing to wait...
+[Weather Oracle] Unexpected NOAA response: 400
+[Exchange Listener] 3 consecutive timeouts; breaking to reconnect...
+[Exchange] Non-ticker message received: subscribed
+[Exchange Listener] WS read timeout (1/3); continuing to wait...
+[Weather Oracle] Unexpected NOAA response: 400
+[Exchange Listener] WS read timeout (2/3); continuing to wait...

@@ -1,0 +1,32 @@
+Starting Triple Oracles (NBA, Crypto, NHL)...
+Starting Exchange Listener (Stream B)...
+[Crypto Oracle] Connected to Binance WS: btcusdt
+[Exchange] Non-ticker message received: subscribed
+[OK] Placed order for KXNHLGAME-26FEB25VGKLA-VGK at 38c
+[OK] Placed order for KXNBAGAME-26FEB25OKCDET-OKC at 1c
+[PING] NHL (KXNHLGAME-26FEB25VGKLA-VGK): p_true=0.5500 | yes_ask=39c
+[PING] Crypto (BVOL-26FEB25-T70000): p_true=0.5000 | yes_ask=Nonec
+[PING] NHL (KXNHLGAME-26FEB25VGKLA-VGK): p_true=0.5500 | yes_ask=39c
+[PING] Crypto (BVOL-26FEB25-T70000): p_true=0.5000 | yes_ask=Nonec
+[PING] NHL (KXNHLGAME-26FEB25VGKLA-VGK): p_true=0.5500 | yes_ask=39c
+[PING] Crypto (BVOL-26FEB25-T70000): p_true=0.0000 | yes_ask=Nonec
+[PING] NHL (KXNHLGAME-26FEB25VGKLA-VGK): p_true=0.5500 | yes_ask=39c
+[PING] Crypto (BVOL-26FEB25-T70000): p_true=0.0000 | yes_ask=Nonec
+[PING] NHL (KXNHLGAME-26FEB25VGKLA-VGK): p_true=0.5500 | yes_ask=39c
+[PING] Crypto (BVOL-26FEB25-T70000): p_true=0.0000 | yes_ask=Nonec
+[PING] NHL (KXNHLGAME-26FEB25VGKLA-VGK): p_true=0.5500 | yes_ask=39c
+[PING] Crypto (BVOL-26FEB25-T70000): p_true=0.0000 | yes_ask=Nonec
+[PING] NHL (KXNHLGAME-26FEB25VGKLA-VGK): p_true=0.5500 | yes_ask=39c
+[PING] Crypto (BVOL-26FEB25-T70000): p_true=0.0000 | yes_ask=Nonec
+[PING] NHL (KXNHLGAME-26FEB25VGKLA-VGK): p_true=0.5500 | yes_ask=39c
+[PING] Crypto (BVOL-26FEB25-T70000): p_true=0.0000 | yes_ask=Nonec
+[PING] NHL (KXNHLGAME-26FEB25VGKLA-VGK): p_true=0.5500 | yes_ask=39c
+[PING] Crypto (BVOL-26FEB25-T70000): p_true=0.0000 | yes_ask=Nonec
+[PING] NHL (KXNHLGAME-26FEB25VGKLA-VGK): p_true=0.5500 | yes_ask=39c
+[PING] Crypto (BVOL-26FEB25-T70000): p_true=0.0000 | yes_ask=Nonec
+[PING] NHL (KXNHLGAME-26FEB25VGKLA-VGK): p_true=0.5500 | yes_ask=39c
+[PING] Crypto (BVOL-26FEB25-T70000): p_true=0.0000 | yes_ask=Nonec
+[PING] NHL (KXNHLGAME-26FEB25VGKLA-VGK): p_true=0.5500 | yes_ask=39c
+[PING] Crypto (BVOL-26FEB25-T70000): p_true=0.0000 | yes_ask=Nonec
+[PING] NHL (KXNHLGAME-26FEB25VGKLA-VGK): p_true=0.5500 | yes_ask=39c
+[PING] Crypto (BVOL-26FEB25-T70000): p_true=0.0000 | yes_ask=Nonec
