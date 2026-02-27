@@ -1,0 +1,9 @@
+{
+  "fetched_at": "2026-02-27T03:14:47.088049+00:00",
+  "spot": 67166.0,
+  "sources": [
+    "coinbase",
+    "kraken",
+    "bitstamp"
+  ]
+}

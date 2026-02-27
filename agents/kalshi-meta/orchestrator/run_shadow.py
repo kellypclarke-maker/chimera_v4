@@ -70,8 +70,16 @@ from specialists.weather.plugin import (
     _resolve_station_context,
     _station_id_from_rules,
 )
-from specialists.nba.plugin import discover_nba_startup_tickers, lookup_nba_live_p_true
-from specialists.nhl.plugin import discover_nhl_startup_tickers, lookup_nhl_live_p_true
+from specialists.nba.plugin import (
+    discover_nba_startup_tickers,
+    lookup_nba_commence_time_utc,
+    lookup_nba_live_p_true,
+)
+from specialists.nhl.plugin import (
+    discover_nhl_startup_tickers,
+    lookup_nhl_commence_time_utc,
+    lookup_nhl_live_p_true,
+)
 
 from specialists.crypto.plugin import (
     _estimate_sigma_and_spot_from_candles as _crypto_estimate_sigma_and_spot_from_candles,
@@ -91,11 +99,35 @@ DEFAULT_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 _KALSHI_MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 _DATE_TOKEN_FULL_RE = re.compile(r"^\d{2}[A-Z]{3}\d{2}$")
 _SPORTS_EVENT_PREFIXES: Tuple[str, ...] = ("KXNBAGAME-", "KXNHLGAME-")
-_SPORTS_DIRECT_MARKET_SUFFIXES: Tuple[str, ...] = ("MIA", "PHI", "CHA", "IND", "NYR")
+_SPORTS_DIRECT_MARKET_SUFFIXES: Tuple[str, ...] = ("MIA", "PHI", "CHA", "IND", "MIN", "LAC", "NYR")
 
 _WS_SNAPSHOT_CACHE_TICKERS: Tuple[str, ...] = ()
 _WS_SNAPSHOT_CACHE_QUOTES: Dict[str, Dict[str, Any]] = {}
 _WS_SNAPSHOT_CACHE_TS_MONO: float = 0.0
+_HF_BENCHMARK_TICKER_DEFAULT = "KXNBAGAME-26FEB26MINLAC-MIN"
+_SENTINEL_POLL_SECONDS = 60.0
+_PREGAME_POLL_SECONDS = 5.0
+_PREGAME_WINDOW_SECONDS = 2.0 * 60.0 * 60.0
+_SNIPER_WINDOW_SECONDS = 60.0 * 60.0
+_CLOSED_MARKET_STATUSES = {
+    "closed",
+    "final",
+    "resolved",
+    "settled",
+    "inactive",
+    "expired",
+    "cancelled",
+}
+ROOT_SHADOW_LEDGER_HEADERS: Tuple[str, ...] = (
+    "timestamp",
+    "oracle_type",
+    "ticker",
+    "action",
+    "price_cents",
+    "quantity",
+    "spot_price",
+    "expected_value",
+)
 
 
 def log_shadow_trade(
@@ -108,21 +140,11 @@ def log_shadow_trade(
     expected_value: Optional[float],
 ) -> None:
     ledger_path = REPO_ROOT / "shadow_ledger.csv"
-    headers = [
-        "timestamp",
-        "oracle_type",
-        "ticker",
-        "action",
-        "price_cents",
-        "quantity",
-        "spot_price",
-        "expected_value",
-    ]
     write_header = not ledger_path.exists()
     with ledger_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if write_header:
-            writer.writerow(headers)
+            writer.writerow(list(ROOT_SHADOW_LEDGER_HEADERS))
         writer.writerow(
             [
                 _utc_now_iso(),
@@ -137,6 +159,30 @@ def log_shadow_trade(
         )
 
 
+def _write_root_shadow_ledger_headers(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(list(ROOT_SHADOW_LEDGER_HEADERS))
+
+
+def _archive_and_reset_root_shadow_ledger() -> Path:
+    src = REPO_ROOT / "shadow_ledger.csv"
+    dst = REPO_ROOT / "shadow_ledger_v1_legacy.csv"
+    if src.exists():
+        archive_target = dst
+        if archive_target.exists():
+            stamp = _utc_now().strftime("%Y%m%dT%H%M%SZ")
+            archive_target = REPO_ROOT / f"shadow_ledger_v1_legacy_{stamp}.csv"
+        src.replace(archive_target)
+        print(f"[SHADOW][LEDGER] archived root ledger src={src} dst={archive_target}")
+    else:
+        print(f"[SHADOW][LEDGER] archive skipped (missing src={src})")
+    _write_root_shadow_ledger_headers(src)
+    print(f"[SHADOW][LEDGER] initialized fresh root ledger path={src}")
+    return src
+
+
 def _parse_float(raw: object) -> Optional[float]:
     try:
         if raw is None:
@@ -147,6 +193,79 @@ def _parse_float(raw: object) -> Optional[float]:
     if not (v == v):  # NaN guard
         return None
     return float(v)
+
+
+def _hf_benchmark_ticker_from_config(config: Dict[str, Any]) -> str:
+    return str(
+        config.get("shadow_high_freq_benchmark_ticker")
+        or os.environ.get("SHADOW_HIGH_FREQ_BENCHMARK_TICKER")
+        or _HF_BENCHMARK_TICKER_DEFAULT
+    ).strip().upper()
+
+
+def _log_hf_eval_sample(
+    *,
+    order: Dict[str, Any],
+    runtime_ticker: str,
+    yes_bid: Optional[int],
+    yes_ask: Optional[int],
+    eval_out: Any,
+    config: Dict[str, Any],
+) -> None:
+    benchmark = _hf_benchmark_ticker_from_config(config)
+    order_ticker = str(order.get("ticker") or "").strip().upper()
+    ticker = str(runtime_ticker or "").strip().upper()
+    if not benchmark:
+        return
+    if ticker != benchmark and order_ticker != benchmark:
+        return
+
+    qty = safe_int(order.get("size_contracts"))
+    quantity = int(qty) if qty is not None and qty > 0 else 1
+
+    price_candidates: List[Optional[int]] = [
+        (safe_int(eval_out.get("intended_price_cents")) if isinstance(eval_out, dict) else None),
+        yes_bid,
+        yes_ask,
+        safe_int(order.get("intended_price_cents")),
+    ]
+    price_cents = 1
+    for cand in price_candidates:
+        if cand is None:
+            continue
+        try:
+            c = int(cand)
+        except Exception:
+            continue
+        if c > 0:
+            price_cents = c
+            break
+
+    p_true = (
+        _parse_float(eval_out.get("p_true"))
+        if isinstance(eval_out, dict)
+        else None
+    )
+    if p_true is None:
+        p_true = _parse_float(order.get("_runtime_last_p_true"))
+
+    ev = (
+        _parse_float(eval_out.get("ev_dollars"))
+        if isinstance(eval_out, dict)
+        else None
+    )
+    log_shadow_trade(
+        oracle_type=_infer_oracle_type(
+            ticker=ticker or order_ticker,
+            category=str(order.get("category") or ""),
+        ),
+        ticker=(ticker or order_ticker),
+        action="eval_hf",
+        price_cents=int(price_cents),
+        quantity=int(quantity),
+        spot_price=(None if p_true is None else float(p_true)),
+        expected_value=(None if ev is None else float(ev)),
+    )
 
 
 def _parse_kv_notes(blob: str) -> Dict[str, str]:
@@ -163,18 +282,59 @@ def _parse_kv_notes(blob: str) -> Dict[str, str]:
     return out
 
 
-def _infer_oracle_type(*, ticker: str, category: str) -> str:
-    cat = str(category or "").strip().lower()
+def _report_category_for_fields(*, ticker: str, event_ticker: str, category: str) -> str:
     t = str(ticker or "").strip().upper()
-    if "nba" in cat or t.startswith("KXNBA"):
+    ev = str(event_ticker or "").strip().upper()
+    cat = str(category or "").strip().lower()
+    blob = f"{t} {ev} {cat}".strip()
+    if t.startswith("KXNBAGAME") or ev.startswith("KXNBAGAME") or "nba" in cat:
+        return "NBA"
+    if t.startswith("KXNHLGAME") or ev.startswith("KXNHLGAME") or "nhl" in cat:
+        return "NHL"
+    if (
+        t.startswith("KXBTC-")
+        or t.startswith("KXETH-")
+        or t.startswith("KXSOL")
+        or "crypto" in cat
+    ):
+        return "CRYPTO"
+    if "econom" in cat:
+        return "WEATHER"
+    if blob:
+        return "WEATHER"
+    return "WEATHER"
+
+
+def _report_category_for_order(order: Dict[str, Any]) -> str:
+    return _report_category_for_fields(
+        ticker=str(order.get("ticker") or ""),
+        event_ticker=str(order.get("event_ticker") or ""),
+        category=str(order.get("category") or ""),
+    )
+
+
+def _runtime_category_for_fields(*, ticker: str, event_ticker: str, category: str) -> str:
+    cat = str(category or "").strip()
+    cat_l = cat.lower()
+    if "econom" in cat_l:
+        return "Economics"
+    rep = _report_category_for_fields(ticker=ticker, event_ticker=event_ticker, category=category)
+    if rep in {"NBA", "NHL"}:
+        return "Sports"
+    if rep == "CRYPTO":
+        return "Crypto"
+    return "Climate and Weather"
+
+
+def _infer_oracle_type(*, ticker: str, category: str) -> str:
+    rep = _report_category_for_fields(ticker=ticker, event_ticker="", category=category)
+    if rep == "NBA":
         return "nba"
-    if "nhl" in cat or t.startswith("KXNHL"):
+    if rep == "NHL":
         return "nhl"
-    if "crypto" in cat or t.startswith("KXBTC-") or t.startswith("KXETH-") or t.startswith("KXSOL"):
+    if rep == "CRYPTO":
         return "crypto"
-    if "weather" in cat or t.startswith("KXHIGH") or t.startswith("KXLOW"):
-        return "weather"
-    return "other"
+    return "weather"
 
 
 def _spot_from_candidate_row(row: Dict[str, str]) -> Optional[float]:
@@ -468,6 +628,116 @@ def _discover_candidates_for_series(
     return list(uniq.values())
 
 
+def _discover_open_sports_market_tickers_from_markets_endpoint(
+    *,
+    session: requests.Session,
+    base_url: str,
+    date_token: str,
+    max_pages: int,
+    page_limit: int,
+) -> List[str]:
+    token = str(date_token or "").strip().upper()
+    base = str(base_url or "").strip().rstrip("/") or DEFAULT_BASE
+    limit = max(1, min(int(page_limit), 1000))
+    out: set[str] = set()
+    def _scan_pass(*, series_ticker: str, pages_limit: int) -> None:
+        cursor = ""
+        pages = 0
+        with_status_filter = True
+        series = str(series_ticker or "").strip().upper()
+        while pages < max(1, int(pages_limit)):
+            params: Dict[str, Any] = {"limit": limit}
+            if series:
+                params["series_ticker"] = series
+            if with_status_filter:
+                params["status"] = "open"
+            if cursor:
+                params["cursor"] = cursor
+            url = f"{base}/markets"
+            try:
+                resp = session.get(url, params=params, timeout=20.0)
+                if with_status_filter and int(resp.status_code) >= 400:
+                    with_status_filter = False
+                    print(
+                        f"[SHADOW][DISCOVERY] /markets rejected status filter "
+                        f"status={resp.status_code} series={series or 'ALL'}; retrying without status param"
+                    )
+                    continue
+                resp.raise_for_status()
+                payload = resp.json() if resp.content else {}
+            except Exception as exc:
+                print(
+                    f"[SHADOW][DISCOVERY] /markets sports fetch failed "
+                    f"series={series or 'ALL'} page={pages + 1} error={exc}"
+                )
+                break
+            if not isinstance(payload, dict):
+                print(
+                    f"[SHADOW][DISCOVERY] /markets sports payload type={type(payload).__name__} "
+                    f"series={series or 'ALL'}; stopping"
+                )
+                break
+            markets = payload.get("markets")
+            if not isinstance(markets, list):
+                print(
+                    f"[SHADOW][DISCOVERY] /markets sports payload missing list 'markets' "
+                    f"series={series or 'ALL'}; stopping"
+                )
+                break
+
+            if pages == 0:
+                first10 = [
+                    str(m.get("ticker") or "").strip().upper()
+                    for m in markets
+                    if isinstance(m, dict) and str(m.get("ticker") or "").strip()
+                ][:10]
+                print(
+                    f"[SHADOW][DISCOVERY] /markets first10_raw_tickers series={series or 'ALL'} "
+                    f"first10={first10} count={len(markets)}"
+                )
+
+            accepted_page = 0
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                ticker = str(market.get("ticker") or "").strip().upper()
+                if not ticker:
+                    continue
+                if not (ticker.startswith("KXNBA") or ticker.startswith("KXNHL")):
+                    continue
+                status = str(market.get("status") or "").strip().lower()
+                if status and status not in {"open", "active", "initialized"}:
+                    continue
+                if token and token not in ticker:
+                    continue
+                if ticker in out:
+                    continue
+                out.add(ticker)
+                accepted_page += 1
+
+            next_cursor = str(payload.get("cursor") or "").strip()
+            pages += 1
+            print(
+                f"[SHADOW][DISCOVERY] /markets sports page={pages} series={series or 'ALL'} "
+                f"accepted={accepted_page} running_total={len(out)} next_cursor={bool(next_cursor)}"
+            )
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+
+    _scan_pass(series_ticker="KXNBAGAME", pages_limit=max_pages)
+    _scan_pass(series_ticker="KXNHLGAME", pages_limit=max_pages)
+    if not out:
+        _scan_pass(series_ticker="", pages_limit=min(max_pages, 5))
+
+    result = sorted(out)
+    print(
+        f"[SHADOW][DISCOVERY] /markets sports discovery date_token={token} "
+        f"count={len(result)} first10={result[:10]}"
+    )
+    return result
+
+
 def _bootstrap_candidates_from_live_discovery(*, day: str, config: Dict[str, Any]) -> List[Dict[str, str]]:
     enabled = str(config.get("shadow_bootstrap_discovery_enabled", "1")).strip().lower() not in {"0", "false", "no"}
     if not enabled:
@@ -569,6 +839,15 @@ def _bootstrap_candidates_from_live_discovery(*, day: str, config: Dict[str, Any
         if not isinstance(sports_series, list):
             sports_series = ["KXNBAGAME", "KXNHLGAME"]
         max_sports = max(1, int(config.get("shadow_bootstrap_max_sports_tickers", 80)))
+        sports_markets_max_pages = max(1, int(config.get("shadow_sports_markets_max_pages", 20)))
+        sports_markets_page_limit = max(1, int(config.get("shadow_sports_markets_page_limit", 1000)))
+        markets_endpoint_sports_tickers = _discover_open_sports_market_tickers_from_markets_endpoint(
+            session=s,
+            base_url=base_url,
+            date_token=str(date_token).strip().upper(),
+            max_pages=sports_markets_max_pages,
+            page_limit=sports_markets_page_limit,
+        )
         try:
             core_sports_tickers = discover_sports_tickers_for_date(
                 session=s,
@@ -585,11 +864,17 @@ def _bootstrap_candidates_from_live_discovery(*, day: str, config: Dict[str, Any
         plugin_nhl_tickers = discover_nhl_startup_tickers(day_iso=day, config=config)
         print(
             f"[SHADOW][DISCOVERY] sports startup nba={len(plugin_nba_tickers)} "
-            f"nhl={len(plugin_nhl_tickers)} core={len(core_sports_tickers)}"
+            f"nhl={len(plugin_nhl_tickers)} core={len(core_sports_tickers)} "
+            f"markets_endpoint={len(markets_endpoint_sports_tickers)}"
         )
         sports_tickers: List[str] = []
         seen_sports: set[str] = set()
-        for mt in list(plugin_nba_tickers) + list(plugin_nhl_tickers) + list(core_sports_tickers):
+        for mt in (
+            list(markets_endpoint_sports_tickers)
+            + list(plugin_nba_tickers)
+            + list(plugin_nhl_tickers)
+            + list(core_sports_tickers)
+        ):
             t = str(mt).strip().upper()
             if not t or t in seen_sports:
                 continue
@@ -1161,13 +1446,11 @@ def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], co
                     if not ticker or ticker in existing:
                         continue
                     classifier = ticker or event_prefix
-                    category = "Other"
-                    if classifier.startswith("KXBTC-") or classifier.startswith("KXETH-") or classifier.startswith("KXSOL"):
-                        category = "Crypto"
-                    elif classifier.startswith("KXHIGH") or classifier.startswith("KXLOW"):
-                        category = "Climate and Weather"
-                    elif classifier.startswith("KXNBA") or classifier.startswith("KXNHL"):
-                        category = "Sports"
+                    category = _runtime_category_for_fields(
+                        ticker=classifier,
+                        event_ticker=str(market.get("event_ticker") or event_prefix),
+                        category=str(market.get("category") or ""),
+                    )
                     forced = _build_candidate_row_from_market(
                         market=market,
                         category=category,
@@ -1307,8 +1590,11 @@ def _migrate_order(order: Dict[str, Any], day: str) -> Dict[str, Any]:
     out.setdefault("ticker", ticker)
     out.setdefault("event_ticker", str(out.get("event_ticker") or ""))
     out.setdefault("category", str(out.get("category") or ""))
-    if (not str(out.get("category") or "").strip()) and (ticker.startswith("KXNBAGAME") or ticker.startswith("KXNHLGAME")):
-        out["category"] = "Sports"
+    out["category"] = _runtime_category_for_fields(
+        ticker=ticker,
+        event_ticker=str(out.get("event_ticker") or ""),
+        category=str(out.get("category") or ""),
+    )
     out.setdefault("side", "yes")
     out.setdefault("action", "post_yes")
     out.setdefault("maker_or_taker", "maker")
@@ -1374,7 +1660,11 @@ def _build_order_from_candidate(*, row: Dict[str, str], day: str, size_contracts
         "strategy_id": str(row.get("strategy_id") or ""),
         "ticker": ticker,
         "event_ticker": str(row.get("event_ticker") or ""),
-        "category": str(row.get("category") or ""),
+        "category": _runtime_category_for_fields(
+            ticker=ticker,
+            event_ticker=str(row.get("event_ticker") or ""),
+            category=str(row.get("category") or ""),
+        ),
         "close_time": str(row.get("close_time") or ""),
         "side": "yes",
         "action": ("buy_yes" if str(execution_mode).strip().lower() == "taker" else "post_yes"),
@@ -1555,7 +1845,11 @@ def _reopen_stale_closed_override_orders(
 
         row = candidate_by_ticker.get(ticker)
         if row is None:
-            category = str(order.get("category") or "").strip() or ("Sports" if _is_sports_ticker(ticker) else "")
+            category = _runtime_category_for_fields(
+                ticker=ticker,
+                event_ticker=str(order.get("event_ticker") or ticker.rsplit("-", 1)[0]),
+                category=str(order.get("category") or ""),
+            )
             row = {
                 "strategy_id": str(order.get("strategy_id") or ""),
                 "ticker": ticker,
@@ -1608,6 +1902,11 @@ def _project_canonical_rows(orders: Iterable[Dict[str, Any]]) -> List[Dict[str, 
     out: List[Dict[str, Any]] = []
     for o in orders:
         row = {k: o.get(k, "") for k in SHADOW_LEDGER_HEADERS}
+        row["category"] = _report_category_for_fields(
+            ticker=str(o.get("ticker") or ""),
+            event_ticker=str(o.get("event_ticker") or ""),
+            category=str(o.get("category") or ""),
+        )
         out.append(row)
     return out
 
@@ -2473,6 +2772,14 @@ def _update_open_order_lifecycle(
     else:
         reason = str(eval_out.get("reason") if isinstance(eval_out, dict) else "model_eval_failed")
         print(f"[SHADOW][EVAL] ticker={ticker} skipped reason={reason}")
+    _log_hf_eval_sample(
+        order=order,
+        runtime_ticker=ticker,
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
+        eval_out=eval_out,
+        config=config,
+    )
 
     if not isinstance(eval_out, dict) or not bool(eval_out.get("ok")):
         reason = str(eval_out.get("reason") if isinstance(eval_out, dict) else "model_eval_failed")
@@ -2727,7 +3034,7 @@ def _grade_resolutions(
         order["notes"] = _append_note(order.get("notes", ""), f"result={result}")
 
 
-def _render_summary(*, day: str, orders: Sequence[Dict[str, Any]], poll_seconds: int, max_runtime_minutes: float) -> str:
+def _render_summary(*, day: str, orders: Sequence[Dict[str, Any]], poll_seconds: float, max_runtime_minutes: float) -> str:
     n_total = len(orders)
     n_open = sum(1 for o in orders if str(o.get("status") or "") == "open")
     n_filled = sum(1 for o in orders if str(o.get("status") or "") == "filled")
@@ -2754,6 +3061,35 @@ def _render_summary(*, day: str, orders: Sequence[Dict[str, Any]], poll_seconds:
                 pass
     roi_total = pnl_sum / deployed_sum if deployed_sum > 0.0 else 0.0
 
+    categories = ("NBA", "NHL", "CRYPTO", "WEATHER")
+    per_cat: Dict[str, Dict[str, float]] = {
+        c: {"pnl": 0.0, "wins": 0.0, "resolved": 0.0, "trades": 0.0}
+        for c in categories
+    }
+
+    def _as_float(v: object) -> float:
+        try:
+            return float(str(v or "0").strip() or "0")
+        except Exception:
+            return 0.0
+
+    def _is_trade(order: Dict[str, Any]) -> bool:
+        status = str(order.get("status") or "").strip().lower()
+        if status in {"filled", "resolved"}:
+            return True
+        return bool(str(order.get("_runtime_fill_trade_id") or "").strip())
+
+    for o in orders:
+        rc = _report_category_for_order(o)
+        stats = per_cat.setdefault(rc, {"pnl": 0.0, "wins": 0.0, "resolved": 0.0, "trades": 0.0})
+        stats["pnl"] += _as_float(o.get("realized_pnl_dollars"))
+        if _is_trade(o):
+            stats["trades"] += 1.0
+        if str(o.get("status") or "").strip().lower() == "resolved":
+            stats["resolved"] += 1.0
+            if _as_float(o.get("realized_pnl_dollars")) > 0.0:
+                stats["wins"] += 1.0
+
     lines: List[str] = []
     lines.append(f"# Shadow Summary {day}")
     lines.append("")
@@ -2770,19 +3106,110 @@ def _render_summary(*, day: str, orders: Sequence[Dict[str, Any]], poll_seconds:
     lines.append(f"- Realized PnL ($): `{pnl_sum:.6f}`")
     lines.append(f"- Realized ROI: `{roi_total:.6f}`")
     lines.append("")
+    lines.append("## Performance by Category")
+    lines.append("")
+    lines.append("| category | pnl ($) | win rate | total trades |")
+    lines.append("|---|---:|---:|---:|")
+    for c in categories:
+        stats = per_cat.get(c, {"pnl": 0.0, "wins": 0.0, "resolved": 0.0, "trades": 0.0})
+        resolved = float(stats.get("resolved", 0.0))
+        win_rate = (float(stats.get("wins", 0.0)) / resolved) if resolved > 0.0 else 0.0
+        lines.append(
+            f"| {c} | {float(stats.get('pnl', 0.0)):.6f} | {win_rate:.4f} | {int(float(stats.get('trades', 0.0)))} |"
+        )
+    lines.append("")
     lines.append("## Orders")
     lines.append("")
     lines.append("| ticker | strategy_id | category | status | yes_px | rev | fill_trade_id | pnl | roi | notes |")
     lines.append("|---|---|---|---|---:|---:|---|---:|---:|---|")
     for o in sorted(orders, key=lambda r: str(r.get("ticker") or "")):
+        rc = _report_category_for_order(o)
         lines.append(
-            f"| {str(o.get('ticker') or '')} | {str(o.get('strategy_id') or '')} | {str(o.get('category') or '')} | "
+            f"| {str(o.get('ticker') or '')} | {str(o.get('strategy_id') or '')} | {rc} | "
             f"{str(o.get('status') or '')} | {str(o.get('intended_price_cents') or '')} | "
             f"{str(o.get('_runtime_revision_count') or 0)} | {str(o.get('_runtime_fill_trade_id') or '')} | "
             f"{str(o.get('realized_pnl_dollars') or '')} | {str(o.get('_runtime_roi') or '')} | {str(o.get('notes') or '')} |"
         )
     lines.append("")
     return "\n".join(lines)
+
+
+def _lookup_sports_commence_time_utc(*, order: Dict[str, Any], config: Dict[str, Any]) -> Optional[dt.datetime]:
+    ticker = str(order.get("_runtime_market_ticker") or order.get("ticker") or "").strip().upper()
+    if not ticker:
+        return None
+    cached = _parse_ts(order.get("_runtime_commence_time_utc"))
+    if cached is not None:
+        return cached
+    event_ticker = str(order.get("event_ticker") or "").strip().upper()
+    title = str(order.get("title") or "")
+    iso: Optional[str] = None
+    if ticker.startswith("KXNBAGAME"):
+        iso = lookup_nba_commence_time_utc(
+            ticker=ticker,
+            event_ticker=event_ticker,
+            title=title,
+            config=config,
+        )
+    elif ticker.startswith("KXNHLGAME"):
+        iso = lookup_nhl_commence_time_utc(
+            ticker=ticker,
+            event_ticker=event_ticker,
+            title=title,
+            config=config,
+        )
+    parsed = _parse_ts(iso)
+    if parsed is not None:
+        order["_runtime_commence_time_utc"] = parsed.isoformat()
+    return parsed
+
+
+def _adaptive_poll_seconds(
+    *,
+    orders: Sequence[Dict[str, Any]],
+    market_cache: Dict[str, Dict[str, Any]],
+    config: Dict[str, Any],
+    sniper_poll_seconds: float,
+) -> Tuple[float, str]:
+    now_utc = _utc_now()
+    mode = "sentinel"
+    poll_s = float(_SENTINEL_POLL_SECONDS)
+    saw_active_sports = False
+
+    for order in orders:
+        status = str(order.get("status") or "").strip().lower()
+        if status not in {"open", "filled"}:
+            continue
+        if not _is_sports_order(order):
+            continue
+        ticker = str(order.get("_runtime_market_ticker") or order.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        market = market_cache.get(ticker) if isinstance(market_cache.get(ticker), dict) else {}
+        market_status = str(market.get("status") or "").strip().lower()
+        if market_status and market_status in _CLOSED_MARKET_STATUSES:
+            continue
+        saw_active_sports = True
+
+        close_ts = _parse_ts(order.get("close_time"))
+        if close_ts is not None:
+            secs_to_close = float((close_ts - now_utc).total_seconds())
+            if 0.0 <= secs_to_close <= _SNIPER_WINDOW_SECONDS:
+                return (max(0.1, float(sniper_poll_seconds)), "sniper:final_market_window")
+
+        commence_ts = _lookup_sports_commence_time_utc(order=order, config=config)
+        if commence_ts is None:
+            continue
+        secs_to_start = float((commence_ts - now_utc).total_seconds())
+        if secs_to_start <= 0.0:
+            return (max(0.1, float(sniper_poll_seconds)), "sniper:live")
+        if secs_to_start <= _PREGAME_WINDOW_SECONDS:
+            mode = "pregame"
+            poll_s = min(poll_s, float(_PREGAME_POLL_SECONDS))
+
+    if mode == "pregame" and saw_active_sports:
+        return (max(0.1, float(poll_s)), "pregame")
+    return (max(0.1, float(_SENTINEL_POLL_SECONDS)), "sentinel")
 
 
 def _all_done(orders: Sequence[Dict[str, Any]]) -> bool:
@@ -2990,7 +3417,7 @@ def _save_outputs(
     *,
     day: str,
     state: Dict[str, Any],
-    poll_seconds: int,
+    poll_seconds: float,
     max_runtime_minutes: float,
     ledger_path: Path,
     summary_path: Path,
@@ -3017,12 +3444,22 @@ def main() -> int:
     parser.add_argument("--poll-seconds", type=float, default=30.0, help="Polling interval seconds.")
     parser.add_argument("--max-runtime-minutes", type=float, default=180.0, help="Max runtime minutes; 0=until done.")
     parser.add_argument("--tickers", default="", help="Optional comma-separated ticker override.")
+    parser.add_argument(
+        "--all-categories",
+        action="store_true",
+        help="Initialize NBA, NHL, Crypto, and Weather discovery together (ignores --tickers overrides).",
+    )
     parser.add_argument("--size-contracts", type=int, default=1, help="Contracts per shadow order (new orders only).")
     parser.add_argument("--force-size-contracts", action="store_true", help="Force size_contracts for all open/filled orders to --size-contracts.")
     parser.add_argument("--backtest", action="store_true", help="Run deterministic backtest mode (no sleep/poll loop).")
     parser.add_argument("--state-path", default="", help="Optional state JSON path.")
     parser.add_argument("--ledger-path", default="", help="Optional ledger CSV output path.")
     parser.add_argument("--summary-path", default="", help="Optional summary markdown output path.")
+    parser.add_argument(
+        "--archive-root-ledger",
+        action="store_true",
+        help="Archive repo-root shadow_ledger.csv to shadow_ledger_v1_legacy.csv and start a fresh root ledger.",
+    )
     args = parser.parse_args()
     print(f"[DEBUG] Entry point reached. Target Date: {args.date}")
     _load_env_list_defaults(REPO_ROOT / "env.list")
@@ -3031,8 +3468,10 @@ def main() -> int:
     tag = re.sub(r"[^A-Za-z0-9_-]+", "-", str(args.tag or "").strip()).strip("-")
     suffix = f"_{tag}" if tag else ""
     day_key = f"{day}{suffix}"
-    poll_seconds = max(0.1, float(args.poll_seconds))
+    sniper_poll_seconds = max(0.1, float(args.poll_seconds))
     max_runtime_minutes = float(args.max_runtime_minutes)
+    if bool(args.archive_root_ledger):
+        _archive_and_reset_root_shadow_ledger()
 
     cfg = _load_config(Path(str(args.config)))
     _normalize_ev_thresholds_for_shadow_test(cfg)
@@ -3050,6 +3489,11 @@ def main() -> int:
     summary_path = _resolve_output_path(args.summary_path, default_summary_path)
 
     tickers_override = _parse_ticker_override(args.tickers)
+    if bool(args.all_categories):
+        if tickers_override:
+            print("[SHADOW][DISCOVERY] --all-categories enabled; ignoring --tickers overrides")
+        tickers_override = []
+        print("[SHADOW][DISCOVERY] --all-categories enabled; bootstrapping NBA/NHL/Crypto/Weather")
     if tickers_override:
         print(f"[SHADOW][DISCOVERY] ticker override active count={len(tickers_override)}")
     else:
@@ -3115,6 +3559,8 @@ def main() -> int:
     start_monotonic = time.monotonic()
     cycle = 0
     last_empty_discovery_attempt = 0.0
+    current_sleep_seconds = float(_SENTINEL_POLL_SECONDS)
+    last_poll_mode = ""
     crypto_series = str(cfg.get("shadow_crypto_series_ticker", "KXBTC")).strip().upper() or "KXBTC"
     btc_priority_prefix = f"{crypto_series}-"
 
@@ -3134,7 +3580,7 @@ def main() -> int:
 
         if not orders and not tickers_override:
             now_mono = time.monotonic()
-            rediscovery_every_s = max(10.0, float(poll_seconds))
+            rediscovery_every_s = max(10.0, float(current_sleep_seconds))
             if (now_mono - last_empty_discovery_attempt) >= rediscovery_every_s:
                 last_empty_discovery_attempt = now_mono
                 print("[SHADOW][DISCOVERY] state has zero orders; retrying dynamic discovery")
@@ -3466,11 +3912,24 @@ def main() -> int:
         ledger_path, summary_path = _save_outputs(
             day=day,
             state=state,
-            poll_seconds=poll_seconds,
+            poll_seconds=sniper_poll_seconds,
             max_runtime_minutes=max_runtime_minutes,
             ledger_path=ledger_path,
             summary_path=summary_path,
         )
+
+        current_sleep_seconds, poll_mode = _adaptive_poll_seconds(
+            orders=orders,
+            market_cache=market_cache,
+            config=cfg,
+            sniper_poll_seconds=sniper_poll_seconds,
+        )
+        if poll_mode != last_poll_mode:
+            print(
+                f"[SHADOW][POLL] mode={poll_mode} sleep_s={current_sleep_seconds:.1f} "
+                f"sniper_s={sniper_poll_seconds:.1f}"
+            )
+            last_poll_mode = poll_mode
 
         if _all_done(orders):
             if orders or tickers_override:
@@ -3478,7 +3937,7 @@ def main() -> int:
             print("[SHADOW][HEARTBEAT] no active orders yet; continuing discovery loop")
         if max_runtime_minutes > 0 and (time.monotonic() - start_monotonic) >= (max_runtime_minutes * 60.0):
             break
-        time.sleep(poll_seconds)
+        time.sleep(current_sleep_seconds)
 
     # Final persist.
     state["updated_ts"] = _utc_now_iso()
@@ -3486,7 +3945,7 @@ def main() -> int:
     ledger_path, summary_path = _save_outputs(
         day=day,
         state=state,
-        poll_seconds=poll_seconds,
+        poll_seconds=sniper_poll_seconds,
         max_runtime_minutes=max_runtime_minutes,
         ledger_path=ledger_path,
         summary_path=summary_path,

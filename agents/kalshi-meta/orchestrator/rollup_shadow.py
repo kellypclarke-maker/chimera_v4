@@ -52,11 +52,16 @@ def _safe_float(raw: object) -> Optional[float]:
     return float(v)
 
 
-def _normalize_oracle_type(raw: object) -> str:
+def _normalize_oracle_type(raw: object, *, ticker: str) -> str:
     s = str(raw or "").strip().lower()
-    if s == "crypto":
+    t = str(ticker or "").strip().upper()
+    if t.startswith("KXNBA") or s == "nba":
+        return "nba"
+    if t.startswith("KXNHL") or s == "nhl":
+        return "nhl"
+    if t.startswith("KXBTC-") or t.startswith("KXETH-") or t.startswith("KXSOL") or s == "crypto":
         return "crypto"
-    if s == "weather":
+    if t.startswith("KXHIGH") or t.startswith("KXLOW") or s == "weather":
         return "weather"
     return "other"
 
@@ -66,10 +71,11 @@ def _parse_row(row: Dict[str, str]) -> Optional[ShadowLedgerRow]:
     qty = _safe_int(row.get("quantity"))
     if price is None or qty is None or price <= 0 or qty <= 0:
         return None
+    ticker = str(row.get("ticker") or "").strip().upper()
     return ShadowLedgerRow(
         timestamp=str(row.get("timestamp") or "").strip(),
-        oracle_type=_normalize_oracle_type(row.get("oracle_type")),
-        ticker=str(row.get("ticker") or "").strip().upper(),
+        oracle_type=_normalize_oracle_type(row.get("oracle_type"), ticker=ticker),
+        ticker=ticker,
         action=str(row.get("action") or "").strip(),
         price_cents=int(price),
         quantity=int(qty),
@@ -129,7 +135,7 @@ def _print_summary(*, path: Path, rows: List[ShadowLedgerRow], skipped: int) -> 
     print("By Oracle Type")
     print("oracle_type | trades | quantity | avg_expected_value | net_simulated_pnl")
     print("----------- | ------ | -------- | ------------------ | -----------------")
-    for oracle in ("crypto", "weather", "other"):
+    for oracle in ("crypto", "weather", "nba", "nhl", "other"):
         if oracle not in grouped:
             continue
         g = grouped[oracle]

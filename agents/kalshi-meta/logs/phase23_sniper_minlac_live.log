@@ -1,0 +1,48 @@
+[DEBUG] Python Path: /mnt/c/Users/kelly/Desktop/chimera_v4/agents/kalshi-meta
+[DEBUG] Entry point reached. Target Date: 26FEB26
+[DEBUG] Force-set key: KALSHI_BASE.
+[DEBUG] Force-set key: KALSHI_API_KEY_ID.
+[DEBUG] Force-set key: KALSHI_PRIVATE_KEY_PATH.
+[DEBUG] Force-set key: GITHUB_API_KEY.
+[DEBUG] Force-set key: OPENAI_API_KEY.
+[DEBUG] Force-set key: OPENAI_PROJECT.
+[DEBUG] Force-set key: OPENAI_MODEL.
+[DEBUG] Force-set key: OPENAI_MODEL_FALLBACK.
+[DEBUG] Force-set key: OPENAI_COMPLETION_TOKENS.
+[DEBUG] Force-set key: OPENAI_MAX_COMPLETION_TOKENS.
+[DEBUG] Force-set key: GEMINI_API_KEY.
+[DEBUG] Force-set key: THE_ODDS_API_KEY.
+[DEBUG] Force-set key: THE_ODDS_API_KEY_20k.
+[DEBUG] Env defaults loaded from /mnt/c/Users/kelly/Desktop/chimera_v4/env.list parsed=13 set=13
+[SHADOW][CONFIG] EV thresholds shadow=0.0000 crypto=0.0000 weather=0.0000 sports=0.0000 nba=0.0000 nhl=0.0000 econ=0.0000
+[SHADOW][DISCOVERY] ticker override active count=1
+[DEBUG] Raw Discovery Output: queue_tickers=[]
+[DEBUG] Raw Discovery Output: daily_rows={}
+[SHADOW][DISCOVERY] queue fallback queue_tickers=0 daily_rows=0 selected=0
+[SHADOW][DISCOVERY] --tickers override applied count=0
+[DEBUG] --tickers direct market override accepted ticker=KXNBAGAME-26FEB26MINLAC-MIN expansion=skipped
+[DEBUG] --tickers force-approve added=1 direct_markets=1 total=1
+[SHADOW][DISCOVERY] no crypto rows found to filter
+[SHADOW][DISCOVERY] final candidates total=1 crypto=0 weather=0 sports=1
+[SHADOW][HEARTBEAT] cycle=1 elapsed_s=0.0 orders_total=1 open=1 filled=0 resolved=0 closed_unfilled=0
+[SHADOW][DISCOVERY] order ticker remap order=KXNBAGAME-26FEB26MINLAC-MIN runtime_market=KXNBAGAME-26FEB26MINLAC-MIN
+[SHADOW][HEARTBEAT] needed_market_tickers=1 open_tickers=1 open_sports=1
+[SHADOW][WS] sports_ws_enabled=True open_sports_tickers=1
+[SHADOW][WS] promoting private auth from env credentials
+[SHADOW][WS] private_auth_effective=True key_id_present=True private_key_present=True
+[SHADOW][WS] connecting for ticker snapshot count=1 timeout_s=5.0
+[KALSHI_WS] snapshot start url=wss://api.elections.kalshi.com/trade-api/ws/v2 tickers=1 timeout_s=5.0
+[KALSHI_WS] connecting url=wss://api.elections.kalshi.com/trade-api/ws/v2 private_auth=1 key_id_present=True header_keys=['KALSHI-ACCESS-KEY', 'KALSHI-ACCESS-SIGNATURE', 'KALSHI-ACCESS-TIMESTAMP']
+[SHADOW][WS] snapshot received=1
+[SHADOW][WS] sports snapshot_tickers=1
+[SHADOW][EVAL] [MAKER_MODE] ticker=KXNBAGAME-26FEB26MINLAC-MIN category=Sports strategy=NA yes_bid=74 yes_ask=75
+[SHADOW][ORACLE] NBA HF benchmark override forcing refresh ticker=KXNBAGAME-26FEB26MINLAC-MIN
+[SHADOW][ORACLE] NBA Odds key fingerprint=6b92...3a91 len=32
+[SHADOW][ORACLE] NBA odds refresh pairs=0 poll_s=180
+[SHADOW][ORACLE] NBA Odds API key present=True
+[SHADOW][ORACLE] NBA Odds key fingerprint=6b92...3a91 len=32
+[SHADOW][ORACLE] NBA odds refresh pairs=0 poll_s=180
+[SHADOW][EVAL] ticker=KXNBAGAME-26FEB26MINLAC-MIN skipped reason=nba_live_odds_missing
+state_json=/mnt/c/Users/kelly/Desktop/chimera_v4/agents/kalshi-meta/data/shadow/26FEB26_phase23_sniper_minlac_live_state.json
+shadow_ledger=/mnt/c/Users/kelly/Desktop/chimera_v4/agents/kalshi-meta/reports/shadow/26FEB26_phase23_sniper_minlac_live_shadow_ledger.csv
+shadow_summary=/mnt/c/Users/kelly/Desktop/chimera_v4/agents/kalshi-meta/reports/shadow/26FEB26_phase23_sniper_minlac_live_shadow_summary.md

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta, timezone
 import os
 import re
 import time
-from typing import Dict, FrozenSet, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 import requests
 
@@ -103,12 +104,16 @@ _ODDS_SPORT_KEY = "icehockey_nhl"
 _ODDS_MARKET = "h2h"
 _ODDS_MIN_POLL_SECONDS = 180.0
 _ORACLE_CACHE_TTL_SECONDS = 180.0
+_TICKER_DATE_TZ = timezone(timedelta(hours=-8))
+_TEMPORAL_BRIDGE_SECONDS = 24.0 * 60.0 * 60.0
 
 _ODDS_CACHE_LAST_FETCH_MONO = 0.0
 _ODDS_CACHE_PAIR_PROBS: Dict[FrozenSet[str], Dict[str, float]] = {}
 _ODDS_CACHE_LOGGED_KEY_STATE = False
 _ODDS_CACHE_LAST_ERROR_WAS_401 = False
 _ORACLE_MATCHUP_CACHE: Dict[FrozenSet[str], Tuple[float, Dict[str, float]]] = {}
+_ODDS_CACHE_LAST_PAYLOAD: List[Dict[str, object]] = []
+_TEMPORAL_BRIDGE_LOGGED: Set[str] = set()
 
 _NHL_TEAM_NAME_TO_CODE: Dict[str, str] = {v: k for k, v in _NHL_TEAM_CODE_TO_NAME.items()}
 _NHL_MANUAL_401_PROBS: Dict[FrozenSet[str], Dict[str, float]] = {
@@ -203,8 +208,212 @@ def _extract_bookmaker_h2h_probs(bookmaker: Dict[str, object]) -> Optional[Dict[
     return None
 
 
+def _parse_date_token(token: str) -> Optional[date]:
+    raw = str(token or "").strip().upper()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%d%b%y").date()
+    except Exception:
+        return None
+
+
+def _parse_commence_time(raw: object) -> Optional[datetime]:
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _extract_game_pair_and_probs(
+    game: Dict[str, object],
+) -> Optional[Tuple[FrozenSet[str], Dict[str, float], Optional[datetime]]]:
+    home = _normalize_team_name(str(game.get("home_team") or ""))
+    away = _normalize_team_name(str(game.get("away_team") or ""))
+    if not home or not away or home == away:
+        return None
+    bookmakers = game.get("bookmakers")
+    if not isinstance(bookmakers, list):
+        return None
+    by_team: Dict[str, List[float]] = {}
+    for bookmaker in bookmakers:
+        if not isinstance(bookmaker, dict):
+            continue
+        probs = _extract_bookmaker_h2h_probs(bookmaker)
+        if not probs:
+            continue
+        for team_name, p in probs.items():
+            by_team.setdefault(team_name, []).append(float(p))
+    if len(by_team) < 2:
+        return None
+    averaged = {team_name: (sum(vals) / len(vals)) for team_name, vals in by_team.items() if vals}
+    total = sum(float(v) for v in averaged.values())
+    if total <= 0.0:
+        return None
+    normalized = {team_name: float(v) / total for team_name, v in averaged.items()}
+    key = frozenset(normalized.keys())
+    if len(key) != 2:
+        return None
+    commence_utc = _parse_commence_time(game.get("commence_time"))
+    return key, normalized, commence_utc
+
+
+def _log_temporal_bridge_once(
+    *,
+    ticker_date_token: str,
+    api_date_token: str,
+    matchup_key: FrozenSet[str],
+    league_tag: str,
+) -> None:
+    ticker_token = str(ticker_date_token or "").strip().upper()
+    api_token = str(api_date_token or "").strip().upper()
+    if not ticker_token or not api_token or ticker_token == api_token:
+        return
+    key = f"{league_tag}:{ticker_token}->{api_token}:{'|'.join(sorted(matchup_key))}"
+    if key in _TEMPORAL_BRIDGE_LOGGED:
+        return
+    _TEMPORAL_BRIDGE_LOGGED.add(key)
+    print(
+        f"[SHADOW][ORACLE][DEBUG] Matched {ticker_token} ticker to {api_token} API event via 24h bridge"
+    )
+
+
+def _select_temporal_matchup_probs_from_payload(
+    *,
+    payload: object,
+    matchup_key: FrozenSet[str],
+    ticker_date_token: str,
+    league_tag: str,
+) -> Optional[Dict[str, float]]:
+    if not isinstance(payload, list):
+        return None
+
+    target_date = _parse_date_token(ticker_date_token)
+    if target_date is None:
+        for game in payload:
+            if not isinstance(game, dict):
+                continue
+            extracted = _extract_game_pair_and_probs(game)
+            if not extracted:
+                continue
+            key, probs, _ = extracted
+            if key == matchup_key:
+                return dict(probs)
+        return None
+
+    anchor_utc = datetime(
+        target_date.year,
+        target_date.month,
+        target_date.day,
+        tzinfo=_TICKER_DATE_TZ,
+    ).astimezone(timezone.utc)
+
+    best_probs: Optional[Dict[str, float]] = None
+    best_delta: Optional[float] = None
+    best_api_token = ""
+    fallback_probs: Optional[Dict[str, float]] = None
+    for game in payload:
+        if not isinstance(game, dict):
+            continue
+        extracted = _extract_game_pair_and_probs(game)
+        if not extracted:
+            continue
+        key, probs, commence_utc = extracted
+        if key != matchup_key:
+            continue
+        if commence_utc is None:
+            if fallback_probs is None:
+                fallback_probs = dict(probs)
+            continue
+        delta_s = abs((commence_utc - anchor_utc).total_seconds())
+        if delta_s > _TEMPORAL_BRIDGE_SECONDS:
+            continue
+        if best_delta is None or delta_s < best_delta:
+            best_delta = float(delta_s)
+            best_probs = dict(probs)
+            best_api_token = commence_utc.strftime("%d%b%y").upper()
+    if best_probs is not None:
+        _log_temporal_bridge_once(
+            ticker_date_token=ticker_date_token,
+            api_date_token=best_api_token,
+            matchup_key=matchup_key,
+            league_tag=league_tag,
+        )
+        return best_probs
+    if fallback_probs is not None:
+        return fallback_probs
+    return None
+
+
+def _select_temporal_matchup_commence_time_from_payload(
+    *,
+    payload: object,
+    matchup_key: FrozenSet[str],
+    ticker_date_token: str,
+    league_tag: str,
+) -> Optional[datetime]:
+    if not isinstance(payload, list):
+        return None
+
+    target_date = _parse_date_token(ticker_date_token)
+    if target_date is None:
+        for game in payload:
+            if not isinstance(game, dict):
+                continue
+            extracted = _extract_game_pair_and_probs(game)
+            if not extracted:
+                continue
+            key, _, commence_utc = extracted
+            if key == matchup_key and commence_utc is not None:
+                return commence_utc
+        return None
+
+    anchor_utc = datetime(
+        target_date.year,
+        target_date.month,
+        target_date.day,
+        tzinfo=_TICKER_DATE_TZ,
+    ).astimezone(timezone.utc)
+
+    best_commence: Optional[datetime] = None
+    best_delta: Optional[float] = None
+    best_api_token = ""
+    for game in payload:
+        if not isinstance(game, dict):
+            continue
+        extracted = _extract_game_pair_and_probs(game)
+        if not extracted:
+            continue
+        key, _, commence_utc = extracted
+        if key != matchup_key or commence_utc is None:
+            continue
+        delta_s = abs((commence_utc - anchor_utc).total_seconds())
+        if delta_s > _TEMPORAL_BRIDGE_SECONDS:
+            continue
+        if best_delta is None or delta_s < best_delta:
+            best_delta = float(delta_s)
+            best_commence = commence_utc
+            best_api_token = commence_utc.strftime("%d%b%y").upper()
+    if best_commence is not None:
+        _log_temporal_bridge_once(
+            ticker_date_token=ticker_date_token,
+            api_date_token=best_api_token,
+            matchup_key=matchup_key,
+            league_tag=league_tag,
+        )
+    return best_commence
+
+
 def _refresh_odds_pair_probabilities(config: Dict[str, object]) -> Dict[FrozenSet[str], Dict[str, float]]:
-    global _ODDS_CACHE_LAST_FETCH_MONO, _ODDS_CACHE_PAIR_PROBS, _ODDS_CACHE_LOGGED_KEY_STATE, _ODDS_CACHE_LAST_ERROR_WAS_401, _ORACLE_MATCHUP_CACHE
+    global _ODDS_CACHE_LAST_FETCH_MONO, _ODDS_CACHE_PAIR_PROBS, _ODDS_CACHE_LOGGED_KEY_STATE, _ODDS_CACHE_LAST_ERROR_WAS_401, _ORACLE_MATCHUP_CACHE, _ODDS_CACHE_LAST_PAYLOAD
 
     api_key = _odds_api_key(config)
     if not _ODDS_CACHE_LOGGED_KEY_STATE:
@@ -254,37 +463,17 @@ def _refresh_odds_pair_probabilities(config: Dict[str, object]) -> Dict[FrozenSe
         return dict(_ODDS_CACHE_PAIR_PROBS)
     if len(payload) == 0:
         print("[SHADOW][ORACLE] NHL Odds API returned 200 with empty list payload.")
+    _ODDS_CACHE_LAST_PAYLOAD = [g for g in payload if isinstance(g, dict)]
 
     pair_probs: Dict[FrozenSet[str], Dict[str, float]] = {}
     for game in payload:
         if not isinstance(game, dict):
             continue
-        home = _normalize_team_name(str(game.get("home_team") or ""))
-        away = _normalize_team_name(str(game.get("away_team") or ""))
-        if not home or not away or home == away:
+        extracted = _extract_game_pair_and_probs(game)
+        if not extracted:
             continue
-        bookmakers = game.get("bookmakers")
-        if not isinstance(bookmakers, list):
-            continue
-        by_team: Dict[str, List[float]] = {}
-        for bookmaker in bookmakers:
-            if not isinstance(bookmaker, dict):
-                continue
-            probs = _extract_bookmaker_h2h_probs(bookmaker)
-            if not probs:
-                continue
-            for team_name, p in probs.items():
-                by_team.setdefault(team_name, []).append(float(p))
-        if len(by_team) < 2:
-            continue
-        averaged = {team_name: (sum(vals) / len(vals)) for team_name, vals in by_team.items() if vals}
-        total = sum(float(v) for v in averaged.values())
-        if total <= 0.0:
-            continue
-        normalized = {team_name: float(v) / total for team_name, v in averaged.items()}
-        key = frozenset(normalized.keys())
-        if len(key) == 2:
-            pair_probs[key] = normalized
+        key, normalized, _ = extracted
+        pair_probs[key] = normalized
 
     _ODDS_CACHE_LAST_FETCH_MONO = now_mono
     _ODDS_CACHE_PAIR_PROBS = pair_probs
@@ -308,7 +497,7 @@ def lookup_nhl_live_p_true(
     parsed = _parse_nhl_ticker_codes(ticker=ticker, event_ticker=event_ticker)
     if parsed is None:
         return None
-    _, team_a_code, team_b_code, side_code = parsed
+    date_token, team_a_code, team_b_code, side_code = parsed
     team_a = _NHL_TEAM_CODE_TO_NAME.get(team_a_code)
     team_b = _NHL_TEAM_CODE_TO_NAME.get(team_b_code)
     if not team_a or not team_b:
@@ -341,7 +530,18 @@ def lookup_nhl_live_p_true(
         if selected_team_code and selected_team_code in manual:
             print("[SHADOW][ORACLE] WARNING: Using Manual Hardcoded Probs due to 401 Error.")
             return float(manual[selected_team_code])
-    game_probs = pair_probs.get(matchup_key)
+    temporal_probs = _select_temporal_matchup_probs_from_payload(
+        payload=_ODDS_CACHE_LAST_PAYLOAD,
+        matchup_key=matchup_key,
+        ticker_date_token=date_token,
+        league_tag="NHL",
+    )
+    if temporal_probs is not None:
+        game_probs = temporal_probs
+    elif not _ODDS_CACHE_LAST_PAYLOAD:
+        game_probs = pair_probs.get(matchup_key)
+    else:
+        game_probs = None
     if not game_probs:
         if cached is not None:
             cached_probs = cached[1]
@@ -358,6 +558,34 @@ def lookup_nhl_live_p_true(
     if not (0.0 <= float(p_true) <= 1.0):
         return None
     return float(p_true)
+
+
+def lookup_nhl_commence_time_utc(
+    *,
+    ticker: str,
+    event_ticker: str,
+    title: str,
+    config: Dict[str, object],
+) -> Optional[str]:
+    parsed = _parse_nhl_ticker_codes(ticker=ticker, event_ticker=event_ticker)
+    if parsed is None:
+        return None
+    date_token, team_a_code, team_b_code, _ = parsed
+    team_a = _NHL_TEAM_CODE_TO_NAME.get(team_a_code)
+    team_b = _NHL_TEAM_CODE_TO_NAME.get(team_b_code)
+    if not team_a or not team_b:
+        return None
+    matchup_key = frozenset({team_a, team_b})
+    _refresh_odds_pair_probabilities(config)
+    commence = _select_temporal_matchup_commence_time_from_payload(
+        payload=_ODDS_CACHE_LAST_PAYLOAD,
+        matchup_key=matchup_key,
+        ticker_date_token=date_token,
+        league_tag="NHL",
+    )
+    if commence is None:
+        return None
+    return commence.isoformat()
 
 
 def _safe_float(raw: object) -> Optional[float]:

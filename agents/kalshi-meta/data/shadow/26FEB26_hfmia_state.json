@@ -1,0 +1,61 @@
+{
+  "run_date": "26FEB26_hfmia",
+  "created_ts": "2026-02-27T01:55:58.777204+00:00",
+  "updated_ts": "2026-02-27T01:56:03.559852+00:00",
+  "orders": [
+    {
+      "shadow_order_id": "shadow-26FEB26_hfmia-KXNBAGAME-26FEB26MIAPHI-MIA",
+      "created_ts": "2026-02-27T01:56:00.562375+00:00",
+      "strategy_id": "",
+      "ticker": "KXNBAGAME-26FEB26MIAPHI-MIA",
+      "event_ticker": "KXNBAGAME-26FEB26MIAPHI",
+      "category": "Sports",
+      "close_time": "",
+      "side": "yes",
+      "action": "post_yes",
+      "maker_or_taker": "maker",
+      "intended_price_cents": 20,
+      "assumed_fill_price_cents": "",
+      "size_contracts": "1",
+      "fees_assumed_dollars": "0.000000",
+      "slippage_assumed_dollars": "0.002500",
+      "rules_text_hash": "",
+      "rules_pointer": "",
+      "resolution_pointer": "",
+      "status": "open",
+      "resolved_ts": "",
+      "resolved_payout_dollars": "",
+      "realized_pnl_dollars": "",
+      "notes": "p_true=0.500000;reprice:50->20@2026-02-27T01:56:00.562375+00:00;rev=1;reprice_from=50;mu=0.2700;sigma=0.0000;p_true=0.255006;forecast_updated=2026-02-27T01:56:00.891915+00:00;station_id=;latest_eval=ev=0.012076,mu=0.2800,sigma=0.0000,p_true=0.255006,forecast_updated=2026-02-27T01:56:03.542811+00:00,station_id=,model=sports,econ_asof=",
+      "_runtime_fill_trade_id": "",
+      "_runtime_filled_ts": "",
+      "_runtime_fill_count_seen": 0,
+      "_runtime_first_fill_trade_id": "",
+      "_runtime_revision_count": 1,
+      "_runtime_last_reprice_ts": "2026-02-27T01:56:00.562375+00:00",
+      "_runtime_roi": "",
+      "_runtime_last_ev": "0.012076",
+      "_runtime_last_p_true": "0.255006",
+      "_runtime_last_p_fill": "0.230000",
+      "_runtime_last_mu": "0.280000",
+      "_runtime_last_sigma": "0.000000",
+      "_runtime_last_forecast_updated": "2026-02-27T01:56:03.542811+00:00",
+      "_runtime_station_id": "",
+      "_runtime_station_name": "",
+      "_runtime_station_lat": "0.000000",
+      "_runtime_station_lon": "0.000000",
+      "_runtime_market_ticker": "KXNBAGAME-26FEB26MIAPHI-MIA"
+    }
+  ],
+  "tickers": {
+    "KXNBAGAME-26FEB26MIAPHI-MIA": {
+      "cursor": "EhIKEA12OFc-9GmbkROjhAzaL6waDAi-8oPNBhCQm6uYAw",
+      "seen_trade_ids": [
+        "72de3b70-3f92-7edc-23f6-79f1e7bcebda",
+        "55a518f0-1030-7477-7005-d3e211f29d93"
+      ],
+      "last_checked_ts": "2026-02-27T01:56:01.690201+00:00",
+      "last_seen_trade_ts": "2026-02-27T01:56:00.844692+00:00"
+    }
+  }
+}

@@ -1370,6 +1370,7 @@ async def run_shadow(
                                     "event": "shadow_signal",
                                     "cmd": "shadow",
                                     "league": lg,
+                                    "category": ("NBA" if lg == "nba" else "NHL" if lg == "nhl" else "WEATHER"),
                                     "date": day.isoformat(),
                                     "snapshot_ts_utc": snap_ts,
                                     "matchup": sr.matchup,
@@ -1414,4 +1415,3 @@ async def run_shadow(
             pass
         except Exception:
             pass
-
