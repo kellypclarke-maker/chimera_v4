@@ -194,6 +194,8 @@ _NHL_ALIASES = _build_alias_map(_NHL_TEAM_CODE_TO_NAME)
 _TEAM_NAME_MISS_LOGGED: set[tuple[str, str]] = set()
 _PARTIAL_LINES_LOCK = threading.Lock()
 _PARTIAL_LINES: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+BOOKMAKER_HIERARCHY: Tuple[str, ...] = ("pinnacle", "draftkings", "polymarket")
+MAX_STALE_LEG_SECONDS = 60.0
 
 
 class AtomicOddsStore:
@@ -327,7 +329,7 @@ def _allowed_sportsbooks(config: Mapping[str, object]) -> set[str]:
     raw = (
         config.get("boltodds_allowed_sportsbooks")
         or os.environ.get("BOLTODDS_ALLOWED_SPORTSBOOKS")
-        or "pinnacle,draftkings"
+        or ",".join(BOOKMAKER_HIERARCHY)
     )
     vals: list[str] = []
     if isinstance(raw, str):
@@ -453,6 +455,13 @@ def _log_name_miss_once(*, league: str, team_name: str) -> None:
     print(f"[SHADOW][ORACLE] BoltOdds unmapped_team league={key[0]} name={team_name}")
 
 
+def _hierarchy_for_allowed_books(allowed_books: set[str]) -> Tuple[str, ...]:
+    ranked = [book for book in BOOKMAKER_HIERARCHY if book in allowed_books or not allowed_books]
+    if ranked:
+        return tuple(ranked)
+    return tuple(BOOKMAKER_HIERARCHY)
+
+
 def _update_partial_line(
     *,
     league: str,
@@ -464,7 +473,8 @@ def _update_partial_line(
     commence_time_utc: Optional[str],
     game_status: str,
     source_ts_ms: int,
-) -> Tuple[Optional[float], Optional[float], Optional[str], str, int]:
+    leg_updated_epoch_s: float,
+) -> None:
     lo, hi = sorted([str(home_code).strip().upper(), str(away_code).strip().upper()])
     cache_key = (str(league).strip().upper(), f"{lo}|{hi}", str(sportsbook or "").strip().lower())
     with _PARTIAL_LINES_LOCK:
@@ -475,20 +485,56 @@ def _update_partial_line(
         merged["away_code"] = str(away_code).strip().upper()
         if home_odds is not None:
             merged["home_odds"] = float(home_odds)
+            merged["home_updated_epoch_s"] = float(leg_updated_epoch_s)
         if away_odds is not None:
             merged["away_odds"] = float(away_odds)
+            merged["away_updated_epoch_s"] = float(leg_updated_epoch_s)
         if commence_time_utc:
             merged["commence_time_utc"] = str(commence_time_utc)
         merged["game_status"] = str(game_status or merged.get("game_status") or "unknown").strip().lower() or "unknown"
         merged["source_ts_ms"] = max(int(source_ts_ms or 0), int(merged.get("source_ts_ms") or 0))
         _PARTIAL_LINES[cache_key] = merged
-        return (
-            (float(merged["home_odds"]) if "home_odds" in merged else None),
-            (float(merged["away_odds"]) if "away_odds" in merged else None),
-            (str(merged.get("commence_time_utc") or "") or None),
-            str(merged.get("game_status") or "unknown").strip().lower() or "unknown",
-            int(merged.get("source_ts_ms") or 0),
-        )
+
+
+def _select_best_complete_line(
+    *,
+    league: str,
+    home_code: str,
+    away_code: str,
+    allowed_books: set[str],
+    max_stale_leg_seconds: float,
+) -> Optional[Dict[str, object]]:
+    lo, hi = sorted([str(home_code).strip().upper(), str(away_code).strip().upper()])
+    pair_key = f"{lo}|{hi}"
+    hierarchy = _hierarchy_for_allowed_books(allowed_books)
+    with _PARTIAL_LINES_LOCK:
+        for sportsbook in hierarchy:
+            cache_key = (str(league).strip().upper(), pair_key, str(sportsbook).strip().lower())
+            merged = _PARTIAL_LINES.get(cache_key)
+            if not isinstance(merged, dict):
+                continue
+            home_odds = merged.get("home_odds")
+            away_odds = merged.get("away_odds")
+            home_updated = merged.get("home_updated_epoch_s")
+            away_updated = merged.get("away_updated_epoch_s")
+            try:
+                home_odds_f = float(home_odds)
+                away_odds_f = float(away_odds)
+                home_updated_f = float(home_updated)
+                away_updated_f = float(away_updated)
+            except Exception:
+                continue
+            if abs(home_updated_f - away_updated_f) > max(1.0, float(max_stale_leg_seconds)):
+                continue
+            return {
+                "sportsbook": sportsbook,
+                "home_odds": home_odds_f,
+                "away_odds": away_odds_f,
+                "commence_time_utc": (str(merged.get("commence_time_utc") or "") or None),
+                "game_status": str(merged.get("game_status") or "unknown").strip().lower() or "unknown",
+                "source_ts_ms": int(merged.get("source_ts_ms") or 0),
+            }
+    return None
 
 
 def _reset_partial_lines() -> None:
@@ -652,8 +698,10 @@ def _parse_msg_to_matchup(
                 pass
 
     now_mono = time.monotonic()
+    leg_updated_epoch_s = time.time()
     stale_seconds = _float_cfg(config, "boltodds_stale_seconds", 5.0)
-    home_odds, away_odds, commence_iso, game_status, source_ts_ms = _update_partial_line(
+    max_stale_leg_seconds = _float_cfg(config, "boltodds_max_stale_leg_seconds", MAX_STALE_LEG_SECONDS)
+    _update_partial_line(
         league=league,
         sportsbook=sportsbook,
         home_code=home_code,
@@ -663,9 +711,22 @@ def _parse_msg_to_matchup(
         commence_time_utc=commence_iso,
         game_status=str(data.get("game_status") or data.get("status") or "unknown").strip().lower() or "unknown",
         source_ts_ms=source_ts_ms,
+        leg_updated_epoch_s=leg_updated_epoch_s,
     )
-    if home_odds is None or away_odds is None:
+    selected_line = _select_best_complete_line(
+        league=league,
+        home_code=home_code,
+        away_code=away_code,
+        allowed_books=allowed_books,
+        max_stale_leg_seconds=max_stale_leg_seconds,
+    )
+    if not isinstance(selected_line, dict):
         return None
+    home_odds = float(selected_line["home_odds"])
+    away_odds = float(selected_line["away_odds"])
+    commence_iso = selected_line.get("commence_time_utc")
+    game_status = str(selected_line.get("game_status") or "unknown").strip().lower() or "unknown"
+    source_ts_ms = int(selected_line.get("source_ts_ms") or 0)
 
     probs = _calc_pair_probabilities(home_odds, away_odds)
     if probs is None:
