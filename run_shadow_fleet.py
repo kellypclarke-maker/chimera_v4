@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from chimera.clients.kalshi import fetch_event, fetch_market
-from chimera.fees import expected_value_yes
+from chimera.fees import FeeConfig, expected_value_yes
 from chimera.trading.autotrade import ExecutionEngine, ManagedOrder
 from chimera.trading.crypto_oracle_v4 import CryptoOracle
 from chimera.trading.weather_oracle_v4 import WeatherOracle
@@ -32,6 +32,13 @@ def _safe_float(value: object) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _kalshi_public_base() -> str:
@@ -89,6 +96,8 @@ class ShadowExecutionEngine(ExecutionEngine):
         super().__init__(tickers, edge_threshold_cents)
         self._latest_spot_by_ticker: Dict[str, Optional[float]] = {}
         self._oracle_type_by_ticker: Dict[str, str] = {}
+        self._fee_config = FeeConfig.from_env()
+        self._shadow_is_maker = _env_flag("SHADOW_IS_MAKER", default=False)
 
         # Override client methods for shadow mode to strictly enforce paper trading.
         engine = self
@@ -145,8 +154,9 @@ class ShadowExecutionEngine(ExecutionEngine):
                 ev = expected_value_yes(
                     p_true=float(p_true),
                     price=float(int(price_cents)) / 100.0,
-                    fee=0.0,
                     adverse_selection_discount=0.05,
+                    is_maker=bool(self._shadow_is_maker),
+                    fee_config=self._fee_config,
                 )
             except Exception:
                 ev = None

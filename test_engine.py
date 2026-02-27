@@ -1,6 +1,7 @@
 import asyncio
 from chimera.trading.autotrade import ExecutionEngine
 from chimera.trading.nba_live_v4 import NBALiveOracle
+from chimera.fees import FeeConfig, expected_value_yes
 
 async def run():
     engine = ExecutionEngine(tickers=["KXNBAGAME-26FEB25OKCDET", "KXNBAGAME-26FEB25SASTOR"], edge_threshold_cents=5.0)
@@ -20,16 +21,18 @@ async def run():
     dynamic_p_home, edge_modifier = engine.oracle.calculate_live_p_true()
     
     price = 50 / 100.0
-    from chimera.fees import expected_value_yes
+    fee_config = FeeConfig.from_env()
     ev = expected_value_yes(
         p_true=dynamic_p_home, 
         price=price, 
-        fee=0.0, 
-        adverse_selection_discount=0.05
+        adverse_selection_discount=0.05,
+        is_maker=False,
+        fee_config=fee_config,
     )
     print(f"[{engine.oracle.__class__.__name__}] Calculating EV for NBA Market:")
     print(f"Dynamic P_true: {dynamic_p_home:.4f}")
     print(f"Price: {price:.2f}")
+    print(f"FeeConfig: {fee_config}")
     print(f"Calculated EV: {ev:.4f}")
 
 asyncio.run(run())
