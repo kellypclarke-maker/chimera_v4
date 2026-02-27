@@ -80,6 +80,12 @@ from specialists.nhl.plugin import (
     lookup_nhl_commence_time_utc,
     lookup_nhl_live_p_true,
 )
+from specialists.boltodds.plugin import (
+    lookup_bolt_nba_commence_time_utc,
+    lookup_bolt_nba_live_p_true,
+    lookup_bolt_nhl_commence_time_utc,
+    lookup_bolt_nhl_live_p_true,
+)
 
 from specialists.crypto.plugin import (
     _estimate_sigma_and_spot_from_candles as _crypto_estimate_sigma_and_spot_from_candles,
@@ -131,6 +137,8 @@ ROOT_SHADOW_LEDGER_HEADERS: Tuple[str, ...] = (
     "spot_price",
     "expected_value",
 )
+_ROOT_HF_LEDGER_ENABLED: bool = True
+_ROOT_HF_LEDGER_PATH: Path = REPO_ROOT / "shadow_ledger.csv"
 
 
 def log_shadow_trade(
@@ -142,7 +150,9 @@ def log_shadow_trade(
     spot_price: Optional[float],
     expected_value: Optional[float],
 ) -> None:
-    ledger_path = REPO_ROOT / "shadow_ledger.csv"
+    if not bool(_ROOT_HF_LEDGER_ENABLED):
+        return
+    ledger_path = Path(_ROOT_HF_LEDGER_PATH)
     write_header = not ledger_path.exists()
     with ledger_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -542,6 +552,48 @@ def _ws_ticker_snapshot(
                 return {}
         print(f"[SHADOW][WS] snapshot failed; falling back to REST ({type(exc).__name__}: {exc})")
         return {}
+
+
+def _load_shared_market_feed(
+    *,
+    path: Path,
+    max_age_seconds: float,
+) -> Dict[str, Dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[SHADOW][FEED] failed to read shared feed path={path} error={exc}")
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    tickers_raw = payload.get("tickers")
+    if not isinstance(tickers_raw, dict):
+        return {}
+    updated_epoch = _parse_float(payload.get("updated_epoch_s"))
+    if updated_epoch is not None and max_age_seconds > 0:
+        age_s = time.time() - float(updated_epoch)
+        if age_s > float(max_age_seconds):
+            print(
+                f"[SHADOW][FEED] shared feed stale path={path} "
+                f"age_s={age_s:.1f} max_age_s={float(max_age_seconds):.1f}"
+            )
+            return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for raw_ticker, raw_market in tickers_raw.items():
+        ticker = str(raw_ticker or "").strip().upper()
+        if not ticker or not isinstance(raw_market, dict):
+            continue
+        out[ticker] = {
+            "ticker": ticker,
+            "yes_bid": safe_int(raw_market.get("yes_bid")),
+            "yes_ask": safe_int(raw_market.get("yes_ask")),
+            "no_bid": safe_int(raw_market.get("no_bid")),
+            "no_ask": safe_int(raw_market.get("no_ask")),
+            "status": str(raw_market.get("status") or "open").strip().lower() or "open",
+            "event_ticker": str(raw_market.get("event_ticker") or "").strip().upper(),
+            "title": str(raw_market.get("title") or ""),
+        }
+    return out
 
 
 def _kalshi_date_token_from_iso(date_iso: str) -> Optional[str]:
@@ -2386,24 +2438,42 @@ def _evaluate_sports_edge(
     ticker = str(market.get("ticker") or order_ticker).strip().upper()
     event_ticker = str(market.get("event_ticker") or order.get("event_ticker") or "").strip().upper()
     title = str(market.get("title") or order.get("title") or "").strip()
+    provider = str(config.get("sports_oracle_provider", "odds_api") or "odds_api").strip().lower()
+    use_boltodds = provider in {"boltodds", "bolt_odds", "bolt"}
 
     if strategy.startswith("NBA_") or ticker.startswith("KXNBA"):
-        live_nba = lookup_nba_live_p_true(
-            ticker=ticker,
-            event_ticker=event_ticker,
-            title=title,
-            config=config,
-        )
+        if use_boltodds:
+            live_nba = lookup_bolt_nba_live_p_true(
+                ticker=ticker,
+                event_ticker=event_ticker,
+                title=title,
+                config=config,
+            )
+        else:
+            live_nba = lookup_nba_live_p_true(
+                ticker=ticker,
+                event_ticker=event_ticker,
+                title=title,
+                config=config,
+            )
         if live_nba is None:
             return {"ok": False, "reason": "nba_live_odds_missing"}
         p_true = float(live_nba)
     elif strategy.startswith("NHL_") or ticker.startswith("KXNHL"):
-        live_nhl = lookup_nhl_live_p_true(
-            ticker=ticker,
-            event_ticker=event_ticker,
-            title=title,
-            config=config,
-        )
+        if use_boltodds:
+            live_nhl = lookup_bolt_nhl_live_p_true(
+                ticker=ticker,
+                event_ticker=event_ticker,
+                title=title,
+                config=config,
+            )
+        else:
+            live_nhl = lookup_nhl_live_p_true(
+                ticker=ticker,
+                event_ticker=event_ticker,
+                title=title,
+                config=config,
+            )
         if live_nhl is None:
             return {"ok": False, "reason": "nhl_live_odds_missing"}
         p_true = float(live_nhl)
@@ -3293,21 +3363,39 @@ def _lookup_sports_commence_time_utc(*, order: Dict[str, Any], config: Dict[str,
         return cached
     event_ticker = str(order.get("event_ticker") or "").strip().upper()
     title = str(order.get("title") or "")
+    provider = str(config.get("sports_oracle_provider", "odds_api") or "odds_api").strip().lower()
+    use_boltodds = provider in {"boltodds", "bolt_odds", "bolt"}
     iso: Optional[str] = None
     if ticker.startswith("KXNBAGAME"):
-        iso = lookup_nba_commence_time_utc(
-            ticker=ticker,
-            event_ticker=event_ticker,
-            title=title,
-            config=config,
-        )
+        if use_boltodds:
+            iso = lookup_bolt_nba_commence_time_utc(
+                ticker=ticker,
+                event_ticker=event_ticker,
+                title=title,
+                config=config,
+            )
+        if not iso:
+            iso = lookup_nba_commence_time_utc(
+                ticker=ticker,
+                event_ticker=event_ticker,
+                title=title,
+                config=config,
+            )
     elif ticker.startswith("KXNHLGAME"):
-        iso = lookup_nhl_commence_time_utc(
-            ticker=ticker,
-            event_ticker=event_ticker,
-            title=title,
-            config=config,
-        )
+        if use_boltodds:
+            iso = lookup_bolt_nhl_commence_time_utc(
+                ticker=ticker,
+                event_ticker=event_ticker,
+                title=title,
+                config=config,
+            )
+        if not iso:
+            iso = lookup_nhl_commence_time_utc(
+                ticker=ticker,
+                event_ticker=event_ticker,
+                title=title,
+                config=config,
+            )
     parsed = _parse_ts(iso)
     if parsed is not None:
         order["_runtime_commence_time_utc"] = parsed.isoformat()
@@ -3605,6 +3693,10 @@ def main() -> int:
     parser.add_argument("--state-path", default="", help="Optional state JSON path.")
     parser.add_argument("--ledger-path", default="", help="Optional ledger CSV output path.")
     parser.add_argument("--summary-path", default="", help="Optional summary markdown output path.")
+    parser.add_argument("--shared-feed-path", default="", help="Optional shared Kalshi market feed JSON path.")
+    parser.add_argument("--shared-feed-max-age-seconds", type=float, default=2.0, help="Max shared feed age before considered stale.")
+    parser.add_argument("--disable-hf-root-ledger", action="store_true", help="Disable repo-root HF eval ledger appends.")
+    parser.add_argument("--hf-root-ledger-path", default="", help="Optional override for root HF eval ledger CSV path.")
     parser.add_argument(
         "--archive-root-ledger",
         action="store_true",
@@ -3625,6 +3717,22 @@ def main() -> int:
 
     cfg = _load_config(Path(str(args.config)))
     _normalize_ev_thresholds_for_shadow_test(cfg)
+    print(
+        f"[SHADOW][CONFIG] sports_oracle_provider="
+        f"{str(cfg.get('sports_oracle_provider', 'odds_api') or 'odds_api').strip().lower()}"
+    )
+    global _ROOT_HF_LEDGER_ENABLED, _ROOT_HF_LEDGER_PATH
+    _ROOT_HF_LEDGER_ENABLED = not bool(args.disable_hf_root_ledger)
+    hf_root_path_raw = str(args.hf_root_ledger_path or cfg.get("shadow_hf_root_ledger_path") or "").strip()
+    if hf_root_path_raw:
+        hf_path = Path(hf_root_path_raw)
+        if not hf_path.is_absolute():
+            hf_path = REPO_ROOT / hf_path
+        _ROOT_HF_LEDGER_PATH = hf_path
+    if not _ROOT_HF_LEDGER_ENABLED:
+        print("[SHADOW][LEDGER] HF root ledger disabled for this run")
+    else:
+        print(f"[SHADOW][LEDGER] HF root ledger path={_ROOT_HF_LEDGER_PATH}")
     base_url = str(cfg.get("base_url") or DEFAULT_BASE).strip().rstrip("/") or DEFAULT_BASE
     execution_mode = _shadow_execution_mode(cfg)
     maker_fee_rate = _shadow_fee_rate(cfg, execution_mode="maker")
@@ -3641,6 +3749,15 @@ def main() -> int:
     state_path = _resolve_output_path(args.state_path, default_state_path)
     ledger_path = _resolve_output_path(args.ledger_path, default_ledger_path)
     summary_path = _resolve_output_path(args.summary_path, default_summary_path)
+    shared_feed_raw = str(args.shared_feed_path or cfg.get("shared_kalshi_feed_path") or "").strip()
+    shared_feed_path = None if not shared_feed_raw else _resolve_output_path(shared_feed_raw, ROOT / "data" / "ops" / "shared_market_feed.json")
+    shared_feed_max_age_seconds = max(0.1, float(args.shared_feed_max_age_seconds or cfg.get("shared_kalshi_feed_max_age_seconds", 2.0)))
+    shared_feed_strict = _as_bool(cfg.get("shared_kalshi_feed_strict"), default=False)
+    if shared_feed_path is not None:
+        print(
+            f"[SHADOW][FEED] shared feed enabled path={shared_feed_path} "
+            f"max_age_s={shared_feed_max_age_seconds:.1f} strict={shared_feed_strict}"
+        )
 
     tickers_override = _parse_ticker_override(args.tickers)
     if bool(args.all_categories):
@@ -3904,6 +4021,24 @@ def main() -> int:
                         _mark_fill(order, matching_trades=matches)
 
             # Fetch fresh market snapshots for lifecycle + grading.
+            shared_feed_quotes: Dict[str, Dict[str, Any]] = {}
+            if shared_feed_path is not None:
+                shared_feed_quotes = _load_shared_market_feed(
+                    path=shared_feed_path,
+                    max_age_seconds=shared_feed_max_age_seconds,
+                )
+                if shared_feed_quotes:
+                    print(
+                        f"[SHADOW][FEED] shared feed quotes loaded={len(shared_feed_quotes)} "
+                        f"needed={len(ordered_needed_tickers)}"
+                    )
+                else:
+                    print("[SHADOW][FEED] shared feed unavailable for this cycle")
+                for ticker in ordered_needed_tickers:
+                    t = str(ticker).strip().upper()
+                    if t and t in shared_feed_quotes:
+                        market_cache[t] = dict(shared_feed_quotes[t])
+
             sports_ws_enabled = str(cfg.get("sports_ws_enabled", "1")).strip().lower() not in {"0", "false", "no"}
             ws_sports_tickers = sorted(open_sports_tickers)
             print(
@@ -3911,7 +4046,28 @@ def main() -> int:
                 f"open_sports_tickers={len(ws_sports_tickers)}"
             )
             ws_received_sports: set[str] = set()
-            if sports_ws_enabled and ws_sports_tickers:
+            if shared_feed_path is not None and ws_sports_tickers:
+                ws_received_sports = {
+                    str(t).strip().upper()
+                    for t in ws_sports_tickers
+                    if str(t).strip().upper() in market_cache
+                }
+                print(
+                    f"[SHADOW][WS] shared feeder supplied sports snapshot_tickers={len(ws_received_sports)}"
+                )
+                if len(ws_received_sports) < len(ws_sports_tickers):
+                    missing = sorted(
+                        [
+                            str(t).strip().upper()
+                            for t in ws_sports_tickers
+                            if str(t).strip().upper() not in ws_received_sports
+                        ]
+                    )
+                    print(
+                        f"[SHADOW][WS] shared feeder missing sports tickers={len(missing)} "
+                        f"strict={shared_feed_strict} first5={missing[:5]}"
+                    )
+            elif sports_ws_enabled and ws_sports_tickers:
                 key_id_present = bool(str(os.environ.get("KALSHI_API_KEY_ID") or "").strip())
                 private_key_inline = str(os.environ.get("KALSHI_API_PRIVATE_KEY") or "").strip()
                 private_key_path = str(os.environ.get("KALSHI_PRIVATE_KEY_PATH") or "").strip()
@@ -3967,6 +4123,8 @@ def main() -> int:
                     if not t:
                         continue
                     if t not in ws_received_sports:
+                        if shared_feed_path is not None and shared_feed_strict:
+                            continue
                         try:
                             market_cache[t] = _fetch_market(session=s, base_url=base_url, ticker=t)
                             print(
@@ -3979,6 +4137,8 @@ def main() -> int:
 
             for ticker in ordered_needed_tickers:
                 if ticker in market_cache:
+                    continue
+                if shared_feed_path is not None and shared_feed_strict:
                     continue
                 try:
                     market_cache[ticker] = _fetch_market(session=s, base_url=base_url, ticker=ticker)
@@ -3997,6 +4157,8 @@ def main() -> int:
                 ]
                 for ticker in override_targets:
                     if ticker in market_cache:
+                        continue
+                    if shared_feed_path is not None and shared_feed_strict:
                         continue
                     try:
                         market_cache[ticker] = _fetch_market(session=s, base_url=base_url, ticker=ticker)

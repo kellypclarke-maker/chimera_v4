@@ -1,0 +1,17 @@
+{
+  "base_url": "https://api.elections.kalshi.com/trade-api/v2",
+  "sports_oracle_provider": "boltodds",
+  "boltodds_enabled": true,
+  "boltodds_stale_seconds": 5.0,
+  "shared_kalshi_feed_strict": true,
+  "shared_kalshi_feed_max_age_seconds": 3.0,
+  "sports_ws_enabled": false,
+  "shadow_empty_discovery_cooldown_seconds": 45,
+  "shadow_sports_watch_only_keep_open": true,
+  "shadow_min_ev_dollars": 0.0,
+  "crypto_min_ev_dollars": 0.0,
+  "weather_min_ev_dollars": 0.0,
+  "sports_min_ev_dollars": 0.0,
+  "nba_min_ev_dollars": 0.0,
+  "nhl_min_ev_dollars": 0.0
+}
