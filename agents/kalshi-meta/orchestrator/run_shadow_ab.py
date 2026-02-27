@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 PYTHON = sys.executable or "python3"
 
 
@@ -24,7 +25,21 @@ def _clean_tag(tag: str) -> str:
     return out.strip("-")
 
 
-def _start_process(cmd: List[str], *, log_path: Path) -> subprocess.Popen:
+def _build_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    existing = str(env.get("PYTHONPATH") or "").strip()
+    entries: List[str] = [str(ROOT), str(REPO_ROOT)]
+    if existing:
+        entries.extend([p for p in existing.split(os.pathsep) if p])
+    deduped: List[str] = []
+    for p in entries:
+        if p and p not in deduped:
+            deduped.append(p)
+    env["PYTHONPATH"] = os.pathsep.join(deduped)
+    return env
+
+
+def _start_process(cmd: List[str], *, log_path: Path, env: dict[str, str]) -> subprocess.Popen:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     fh = log_path.open("a", encoding="utf-8")
     fh.write(f"\n\n===== START {dt.datetime.now(dt.timezone.utc).isoformat()} =====\n")
@@ -32,6 +47,7 @@ def _start_process(cmd: List[str], *, log_path: Path) -> subprocess.Popen:
     proc = subprocess.Popen(
         cmd,
         cwd=str(ROOT),
+        env=env,
         stdout=fh,
         stderr=subprocess.STDOUT,
         text=True,
@@ -86,6 +102,8 @@ def main() -> int:
 
     out_root = Path(str(args.output_dir)).resolve() / run_id
     out_root.mkdir(parents=True, exist_ok=True)
+    subprocess_env = _build_subprocess_env()
+    print(f"[AB] PYTHONPATH={subprocess_env.get('PYTHONPATH', '')}")
 
     control_state = out_root / "control_state.json"
     control_ledger = out_root / "control_shadow_ledger.csv"
@@ -182,11 +200,11 @@ def main() -> int:
     experiment_proc: Optional[subprocess.Popen] = None
 
     try:
-        feeder_proc = _start_process(feeder_cmd, log_path=out_root / "shared_feeder.log")
+        feeder_proc = _start_process(feeder_cmd, log_path=out_root / "shared_feeder.log", env=subprocess_env)
         time.sleep(1.0)
-        control_proc = _start_process(control_cmd, log_path=out_root / "control.log")
+        control_proc = _start_process(control_cmd, log_path=out_root / "control.log", env=subprocess_env)
         time.sleep(1.0)
-        experiment_proc = _start_process(experiment_cmd, log_path=out_root / "experiment.log")
+        experiment_proc = _start_process(experiment_cmd, log_path=out_root / "experiment.log", env=subprocess_env)
 
         print(
             f"[AB] processes started feeder_pid={feeder_proc.pid} "
