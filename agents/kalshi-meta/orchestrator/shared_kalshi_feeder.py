@@ -6,6 +6,7 @@ import asyncio
 import datetime as dt
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
@@ -13,8 +14,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 import requests
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from kalshi_core.clients.kalshi_public import DEFAULT_BASE
+from kalshi_core.clients.kalshi_public import DEFAULT_MAIN_BASE as DEFAULT_BASE
 from kalshi_core.clients.kalshi_ws import ws_collect_ticker_snapshot
 from specialists.helpers import safe_int
 
