@@ -3903,445 +3903,464 @@ def main() -> int:
     last_poll_mode = ""
     crypto_series = str(cfg.get("shadow_crypto_series_ticker", "KXBTC")).strip().upper() or "KXBTC"
     btc_priority_prefix = f"{crypto_series}-"
+    loop_error_count = 0
 
     while True:
         cycle += 1
-        orders = [o for o in state.get("orders", []) if isinstance(o, dict)]
-        n_open = sum(1 for o in orders if str(o.get("status") or "") == "open")
-        n_filled = sum(1 for o in orders if str(o.get("status") or "") == "filled")
-        n_resolved = sum(1 for o in orders if str(o.get("status") or "") == "resolved")
-        n_closed = sum(1 for o in orders if str(o.get("status") or "") == "closed_unfilled")
-        elapsed_s = time.monotonic() - start_monotonic
-        print(
-            f"[SHADOW][HEARTBEAT] cycle={cycle} elapsed_s={elapsed_s:.1f} "
-            f"orders_total={len(orders)} open={n_open} filled={n_filled} "
-            f"resolved={n_resolved} closed_unfilled={n_closed}"
-        )
-
-        if not orders and not tickers_override:
-            now_mono = time.monotonic()
-            rediscovery_every_s = max(30.0, float(empty_discovery_cooldown_s), float(current_sleep_seconds))
-            if (now_mono - last_empty_discovery_attempt) >= rediscovery_every_s:
-                last_empty_discovery_attempt = now_mono
-                print("[SHADOW][DISCOVERY] state has zero orders; retrying dynamic discovery")
-                fresh_candidates = _discover_shadow_candidates(day=day, tickers_override=(), config=cfg)
-                if fresh_candidates:
-                    state = _initialize_or_update_state(
-                        state=state,
-                        day=day_key,
-                        candidates=fresh_candidates,
-                        size_contracts=int(args.size_contracts),
-                        execution_mode=execution_mode,
-                    )
-                    orders = [o for o in state.get("orders", []) if isinstance(o, dict)]
-                    print(f"[SHADOW][DISCOVERY] rediscovery added orders={len(orders)}")
-                else:
-                    print("[SHADOW][DISCOVERY] rediscovery found 0 candidates")
-
-        explicit_override_tickers = {str(t).strip().upper() for t in tickers_override if str(t).strip()}
-        parent_sports_event_tickers = sorted(
-            {
-                str(o.get("ticker") or "").strip().upper()
-                for o in orders
-                if str(o.get("status") or "").strip().lower() in {"open", "filled"}
-                and _is_parent_sports_event_ticker(str(o.get("ticker") or ""))
-            }
-        )
-        parent_sports_event_markets: Dict[str, List[str]] = {}
-        if parent_sports_event_tickers:
-            with requests.Session() as expand_session:
-                for parent_event_ticker in parent_sports_event_tickers:
-                    expanded_markets = _expand_parent_sports_event_to_market_tickers(
-                        session=expand_session,
-                        base_url=base_url,
-                        parent_event_ticker=parent_event_ticker,
-                    )
-                    if expanded_markets:
-                        parent_sports_event_markets[parent_event_ticker] = expanded_markets
-
-        ghost_purged = 0
-        ghost_tickers: set[str] = set()
-        ghost_now_iso = _utc_now_iso()
-        for o in orders:
-            status = str(o.get("status") or "").strip().lower()
-            if status not in {"open", "filled"}:
-                continue
-            ticker = str(o.get("ticker") or "").strip().upper()
-            if not _is_parent_sports_event_ticker(ticker):
-                continue
-            if ticker in explicit_override_tickers:
-                # Explicitly declared parent events may be kept for later expansion attempts.
-                continue
-            if ticker in parent_sports_event_markets:
-                continue
-            _close_order_unfilled(
-                o,
-                reason="ghost_parent_event_ticker_unresolved",
-                now_iso=ghost_now_iso,
-                audit_note=f"ticker={ticker}",
-            )
-            ghost_purged += 1
-            ghost_tickers.add(ticker)
-        if ghost_purged > 0:
-            ticker_state = state.get("tickers")
-            if isinstance(ticker_state, dict):
-                for t in sorted(ghost_tickers):
-                    ticker_state.pop(t, None)
-            print(
-                f"[SHADOW][DISCOVERY] purged unresolved parent event ghost orders={ghost_purged} "
-                f"tickers={sorted(ghost_tickers)}"
-            )
-
-        open_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
-        needed_market_tickers: set[str] = set()
-        open_sports_tickers: set[str] = set()
-        priority_active = True
-        resolution_lookahead_minutes = float(cfg.get("shadow_resolution_lookahead_minutes", 0.0))
-        resolution_cutoff = _utc_now() + dt.timedelta(minutes=float(resolution_lookahead_minutes))
-        for o in orders:
-            ticker = str(o.get("ticker") or "").strip().upper()
-            if not ticker:
-                continue
-            status = str(o.get("status") or "").strip().lower()
-            runtime_ticker = ticker
-            if _is_parent_sports_event_ticker(ticker):
-                expanded = parent_sports_event_markets.get(ticker, [])
-                runtime_ticker = (expanded[0] if expanded else "")
-                if (not runtime_ticker) and status in {"open", "filled"}:
-                    print(f"[SHADOW][DISCOVERY] unresolved parent event ticker={ticker} (no child market ticker)")
-
-            prev_runtime_ticker = str(o.get("_runtime_market_ticker") or "").strip().upper()
-            o["_runtime_market_ticker"] = runtime_ticker
-            if runtime_ticker.startswith("KXNBAGAME") or runtime_ticker.startswith("KXNHLGAME"):
-                o["category"] = "Sports"
-            if runtime_ticker and prev_runtime_ticker != runtime_ticker:
-                print(f"[SHADOW][DISCOVERY] order ticker remap order={ticker} runtime_market={runtime_ticker}")
-            if not runtime_ticker:
-                continue
-
-            if status == "open":
-                needed_market_tickers.add(runtime_ticker)
-                open_by_ticker.setdefault(runtime_ticker, []).append(o)
-                if _is_sports_order(o):
-                    open_sports_tickers.add(runtime_ticker)
-            elif status == "filled":
-                if _filled_order_needs_market_watch(order=o, resolution_cutoff=resolution_cutoff):
-                    needed_market_tickers.add(runtime_ticker)
-        print(
-            f"[SHADOW][HEARTBEAT] needed_market_tickers={len(needed_market_tickers)} "
-            f"open_tickers={len(open_by_ticker)} open_sports={len(open_sports_tickers)}"
-        )
-        if priority_active:
-            btc_needed = sum(1 for t in needed_market_tickers if str(t).startswith(btc_priority_prefix))
-            if btc_needed > 0:
+        try:
+                orders = [o for o in state.get("orders", []) if isinstance(o, dict)]
+                n_open = sum(1 for o in orders if str(o.get("status") or "") == "open")
+                n_filled = sum(1 for o in orders if str(o.get("status") or "") == "filled")
+                n_resolved = sum(1 for o in orders if str(o.get("status") or "") == "resolved")
+                n_closed = sum(1 for o in orders if str(o.get("status") or "") == "closed_unfilled")
+                elapsed_s = time.monotonic() - start_monotonic
                 print(
-                    f"[SHADOW][PRIORITY] btc_priority_prefix={btc_priority_prefix} "
-                    f"needed={btc_needed}"
+                    f"[SHADOW][HEARTBEAT] cycle={cycle} elapsed_s={elapsed_s:.1f} "
+                    f"orders_total={len(orders)} open={n_open} filled={n_filled} "
+                    f"resolved={n_resolved} closed_unfilled={n_closed}"
                 )
 
-        ordered_open_tickers = _sorted_with_priority_prefix(
-            open_by_ticker.keys(),
-            priority_prefix=btc_priority_prefix,
-            priority_active=priority_active,
-        )
-        ordered_needed_tickers = _sorted_with_priority_prefix(
-            needed_market_tickers,
-            priority_prefix=btc_priority_prefix,
-            priority_active=priority_active,
-        )
+                if not orders and not tickers_override:
+                    now_mono = time.monotonic()
+                    rediscovery_every_s = max(30.0, float(empty_discovery_cooldown_s), float(current_sleep_seconds))
+                    if (now_mono - last_empty_discovery_attempt) >= rediscovery_every_s:
+                        last_empty_discovery_attempt = now_mono
+                        print("[SHADOW][DISCOVERY] state has zero orders; retrying dynamic discovery")
+                        fresh_candidates = _discover_shadow_candidates(day=day, tickers_override=(), config=cfg)
+                        if fresh_candidates:
+                            state = _initialize_or_update_state(
+                                state=state,
+                                day=day_key,
+                                candidates=fresh_candidates,
+                                size_contracts=int(args.size_contracts),
+                                execution_mode=execution_mode,
+                            )
+                            orders = [o for o in state.get("orders", []) if isinstance(o, dict)]
+                            print(f"[SHADOW][DISCOVERY] rediscovery added orders={len(orders)}")
+                        else:
+                            print("[SHADOW][DISCOVERY] rediscovery found 0 candidates")
 
-        market_cache: Dict[str, Dict[str, Any]] = {}
-        with requests.Session() as s:
-            # Fill detection first, against current active quote state.
-            for ticker in ordered_open_tickers:
-                ticker_orders = open_by_ticker.get(ticker, [])
-                maker_orders = [
-                    o
-                    for o in ticker_orders
-                    if str(o.get("maker_or_taker") or execution_mode).strip().lower() != "taker"
-                ]
-                if not maker_orders:
-                    continue
-                created_cutoff = min((_parse_ts(o.get("created_ts")) or _utc_now()) for o in maker_orders)
-                ts = state.setdefault("tickers", {}).setdefault(
-                    ticker,
-                    {"cursor": "", "seen_trade_ids": [], "last_checked_ts": "", "last_seen_trade_ts": ""},
+                explicit_override_tickers = {str(t).strip().upper() for t in tickers_override if str(t).strip()}
+                parent_sports_event_tickers = sorted(
+                    {
+                        str(o.get("ticker") or "").strip().upper()
+                        for o in orders
+                        if str(o.get("status") or "").strip().lower() in {"open", "filled"}
+                        and _is_parent_sports_event_ticker(str(o.get("ticker") or ""))
+                    }
                 )
-                new_trades = _poll_new_trades_for_ticker(
-                    session=s,
-                    base_url=base_url,
-                    ticker=ticker,
-                    created_cutoff=created_cutoff,
-                    ticker_state=ts,
-                    seen_cap=seen_cap,
-                )
+                parent_sports_event_markets: Dict[str, List[str]] = {}
+                if parent_sports_event_tickers:
+                    with requests.Session() as expand_session:
+                        for parent_event_ticker in parent_sports_event_tickers:
+                            expanded_markets = _expand_parent_sports_event_to_market_tickers(
+                                session=expand_session,
+                                base_url=base_url,
+                                parent_event_ticker=parent_event_ticker,
+                            )
+                            if expanded_markets:
+                                parent_sports_event_markets[parent_event_ticker] = expanded_markets
 
-                for order in sorted(maker_orders, key=lambda o: str(o.get("created_ts") or "")):
-                    if str(order.get("status") or "") != "open":
+                ghost_purged = 0
+                ghost_tickers: set[str] = set()
+                ghost_now_iso = _utc_now_iso()
+                for o in orders:
+                    status = str(o.get("status") or "").strip().lower()
+                    if status not in {"open", "filled"}:
                         continue
-                    matches = _matching_fill_trades(order, new_trades)
-                    if matches:
-                        _mark_fill(order, matching_trades=matches)
-
-            # Fetch fresh market snapshots for lifecycle + grading.
-            shared_feed_quotes: Dict[str, Dict[str, Any]] = {}
-            if shared_feed_path is not None:
-                shared_feed_quotes = _load_shared_market_feed(
-                    path=shared_feed_path,
-                    max_age_seconds=shared_feed_max_age_seconds,
-                )
-                if shared_feed_quotes:
-                    print(
-                        f"[SHADOW][FEED] shared feed quotes loaded={len(shared_feed_quotes)} "
-                        f"needed={len(ordered_needed_tickers)}"
+                    ticker = str(o.get("ticker") or "").strip().upper()
+                    if not _is_parent_sports_event_ticker(ticker):
+                        continue
+                    if ticker in explicit_override_tickers:
+                        # Explicitly declared parent events may be kept for later expansion attempts.
+                        continue
+                    if ticker in parent_sports_event_markets:
+                        continue
+                    _close_order_unfilled(
+                        o,
+                        reason="ghost_parent_event_ticker_unresolved",
+                        now_iso=ghost_now_iso,
+                        audit_note=f"ticker={ticker}",
                     )
-                else:
-                    print("[SHADOW][FEED] shared feed unavailable for this cycle")
-                for ticker in ordered_needed_tickers:
-                    t = str(ticker).strip().upper()
-                    if t and t in shared_feed_quotes:
-                        market_cache[t] = dict(shared_feed_quotes[t])
+                    ghost_purged += 1
+                    ghost_tickers.add(ticker)
+                if ghost_purged > 0:
+                    ticker_state = state.get("tickers")
+                    if isinstance(ticker_state, dict):
+                        for t in sorted(ghost_tickers):
+                            ticker_state.pop(t, None)
+                    print(
+                        f"[SHADOW][DISCOVERY] purged unresolved parent event ghost orders={ghost_purged} "
+                        f"tickers={sorted(ghost_tickers)}"
+                    )
 
-            sports_ws_enabled = str(cfg.get("sports_ws_enabled", "1")).strip().lower() not in {"0", "false", "no"}
-            ws_sports_tickers = sorted(open_sports_tickers)
-            print(
-                f"[SHADOW][WS] sports_ws_enabled={sports_ws_enabled} "
-                f"open_sports_tickers={len(ws_sports_tickers)}"
-            )
-            ws_received_sports: set[str] = set()
-            if shared_feed_path is not None and ws_sports_tickers:
-                ws_received_sports = {
-                    str(t).strip().upper()
-                    for t in ws_sports_tickers
-                    if str(t).strip().upper() in market_cache
-                }
+                open_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
+                needed_market_tickers: set[str] = set()
+                open_sports_tickers: set[str] = set()
+                priority_active = True
+                resolution_lookahead_minutes = float(cfg.get("shadow_resolution_lookahead_minutes", 0.0))
+                resolution_cutoff = _utc_now() + dt.timedelta(minutes=float(resolution_lookahead_minutes))
+                for o in orders:
+                    ticker = str(o.get("ticker") or "").strip().upper()
+                    if not ticker:
+                        continue
+                    status = str(o.get("status") or "").strip().lower()
+                    runtime_ticker = ticker
+                    if _is_parent_sports_event_ticker(ticker):
+                        expanded = parent_sports_event_markets.get(ticker, [])
+                        runtime_ticker = (expanded[0] if expanded else "")
+                        if (not runtime_ticker) and status in {"open", "filled"}:
+                            print(f"[SHADOW][DISCOVERY] unresolved parent event ticker={ticker} (no child market ticker)")
+
+                    prev_runtime_ticker = str(o.get("_runtime_market_ticker") or "").strip().upper()
+                    o["_runtime_market_ticker"] = runtime_ticker
+                    if runtime_ticker.startswith("KXNBAGAME") or runtime_ticker.startswith("KXNHLGAME"):
+                        o["category"] = "Sports"
+                    if runtime_ticker and prev_runtime_ticker != runtime_ticker:
+                        print(f"[SHADOW][DISCOVERY] order ticker remap order={ticker} runtime_market={runtime_ticker}")
+                    if not runtime_ticker:
+                        continue
+
+                    if status == "open":
+                        needed_market_tickers.add(runtime_ticker)
+                        open_by_ticker.setdefault(runtime_ticker, []).append(o)
+                        if _is_sports_order(o):
+                            open_sports_tickers.add(runtime_ticker)
+                    elif status == "filled":
+                        if _filled_order_needs_market_watch(order=o, resolution_cutoff=resolution_cutoff):
+                            needed_market_tickers.add(runtime_ticker)
                 print(
-                    f"[SHADOW][WS] shared feeder supplied sports snapshot_tickers={len(ws_received_sports)}"
+                    f"[SHADOW][HEARTBEAT] needed_market_tickers={len(needed_market_tickers)} "
+                    f"open_tickers={len(open_by_ticker)} open_sports={len(open_sports_tickers)}"
                 )
-                if len(ws_received_sports) < len(ws_sports_tickers):
-                    missing = sorted(
-                        [
+                if priority_active:
+                    btc_needed = sum(1 for t in needed_market_tickers if str(t).startswith(btc_priority_prefix))
+                    if btc_needed > 0:
+                        print(
+                            f"[SHADOW][PRIORITY] btc_priority_prefix={btc_priority_prefix} "
+                            f"needed={btc_needed}"
+                        )
+
+                ordered_open_tickers = _sorted_with_priority_prefix(
+                    open_by_ticker.keys(),
+                    priority_prefix=btc_priority_prefix,
+                    priority_active=priority_active,
+                )
+                ordered_needed_tickers = _sorted_with_priority_prefix(
+                    needed_market_tickers,
+                    priority_prefix=btc_priority_prefix,
+                    priority_active=priority_active,
+                )
+
+                market_cache: Dict[str, Dict[str, Any]] = {}
+                with requests.Session() as s:
+                    # Fill detection first, against current active quote state.
+                    for ticker in ordered_open_tickers:
+                        ticker_orders = open_by_ticker.get(ticker, [])
+                        maker_orders = [
+                            o
+                            for o in ticker_orders
+                            if str(o.get("maker_or_taker") or execution_mode).strip().lower() != "taker"
+                        ]
+                        if not maker_orders:
+                            continue
+                        created_cutoff = min((_parse_ts(o.get("created_ts")) or _utc_now()) for o in maker_orders)
+                        ts = state.setdefault("tickers", {}).setdefault(
+                            ticker,
+                            {"cursor": "", "seen_trade_ids": [], "last_checked_ts": "", "last_seen_trade_ts": ""},
+                        )
+                        new_trades = _poll_new_trades_for_ticker(
+                            session=s,
+                            base_url=base_url,
+                            ticker=ticker,
+                            created_cutoff=created_cutoff,
+                            ticker_state=ts,
+                            seen_cap=seen_cap,
+                        )
+
+                        for order in sorted(maker_orders, key=lambda o: str(o.get("created_ts") or "")):
+                            if str(order.get("status") or "") != "open":
+                                continue
+                            matches = _matching_fill_trades(order, new_trades)
+                            if matches:
+                                _mark_fill(order, matching_trades=matches)
+
+                    # Fetch fresh market snapshots for lifecycle + grading.
+                    shared_feed_quotes: Dict[str, Dict[str, Any]] = {}
+                    if shared_feed_path is not None:
+                        shared_feed_quotes = _load_shared_market_feed(
+                            path=shared_feed_path,
+                            max_age_seconds=shared_feed_max_age_seconds,
+                        )
+                        if shared_feed_quotes:
+                            print(
+                                f"[SHADOW][FEED] shared feed quotes loaded={len(shared_feed_quotes)} "
+                                f"needed={len(ordered_needed_tickers)}"
+                            )
+                        else:
+                            print("[SHADOW][FEED] shared feed unavailable for this cycle")
+                        for ticker in ordered_needed_tickers:
+                            t = str(ticker).strip().upper()
+                            if t and t in shared_feed_quotes:
+                                market_cache[t] = dict(shared_feed_quotes[t])
+
+                    sports_ws_enabled = str(cfg.get("sports_ws_enabled", "1")).strip().lower() not in {"0", "false", "no"}
+                    ws_sports_tickers = sorted(open_sports_tickers)
+                    print(
+                        f"[SHADOW][WS] sports_ws_enabled={sports_ws_enabled} "
+                        f"open_sports_tickers={len(ws_sports_tickers)}"
+                    )
+                    ws_received_sports: set[str] = set()
+                    if shared_feed_path is not None and ws_sports_tickers:
+                        ws_received_sports = {
                             str(t).strip().upper()
                             for t in ws_sports_tickers
-                            if str(t).strip().upper() not in ws_received_sports
-                        ]
-                    )
-                    print(
-                        f"[SHADOW][WS] shared feeder missing sports tickers={len(missing)} "
-                        f"strict={shared_feed_strict} first5={missing[:5]}"
-                    )
-            elif sports_ws_enabled and ws_sports_tickers:
-                key_id_present = bool(str(os.environ.get("KALSHI_API_KEY_ID") or "").strip())
-                private_key_inline = str(os.environ.get("KALSHI_API_PRIVATE_KEY") or "").strip()
-                private_key_path = str(os.environ.get("KALSHI_PRIVATE_KEY_PATH") or "").strip()
-                private_key_path_exists = bool(private_key_path and Path(private_key_path).exists())
-                private_key_present = bool(private_key_inline or private_key_path_exists)
-                if private_key_path and not private_key_inline and not private_key_path_exists:
-                    print(
-                        f"[SHADOW][WS] private key path missing on disk; "
-                        f"disabling private auth path={private_key_path}"
-                    )
-                use_private_auth = _as_bool(cfg.get("sports_ws_use_private_auth"), default=False)
-                if use_private_auth and not (key_id_present and private_key_present):
-                    use_private_auth = False
-                    print(
-                        "[SHADOW][WS] config requested private auth but credentials are incomplete; "
-                        "disabling private auth for this cycle"
-                    )
-                if not use_private_auth and key_id_present and private_key_present:
-                    use_private_auth = True
-                    print("[SHADOW][WS] promoting private auth from env credentials")
-                print(
-                    f"[SHADOW][WS] private_auth_effective={use_private_auth} "
-                    f"key_id_present={key_id_present} private_key_present={private_key_present}"
-                )
-                ws_quotes = _ws_ticker_snapshot(
-                    market_tickers=ws_sports_tickers,
-                    use_private_auth=use_private_auth,
-                    timeout_s=float(cfg.get("sports_ws_timeout_seconds", 15.0)),
-                    min_refresh_s=float(cfg.get("sports_ws_min_refresh_seconds", 2.0)),
-                )
-                print(f"[SHADOW][WS] sports snapshot_tickers={len(ws_quotes)}")
-                if not ws_quotes:
-                    print("[SHADOW][WS] snapshot returned 0 sports tickers; forcing REST fallback")
-                for mt, msg in ws_quotes.items():
-                    if not isinstance(msg, dict):
-                        continue
-                    ticker = str(mt).strip().upper()
-                    ws_received_sports.add(ticker)
-                    market_cache[ticker] = {
-                        "ticker": ticker,
-                        "yes_bid": safe_int(msg.get("yes_bid")),
-                        "yes_ask": safe_int(msg.get("yes_ask")),
-                        "no_bid": safe_int(msg.get("no_bid")),
-                        "no_ask": safe_int(msg.get("no_ask")),
-                        "status": "open",
-                    }
-            elif not ws_sports_tickers:
-                print("[SHADOW][WS] skipped sports snapshot (no open sports orders)")
+                            if str(t).strip().upper() in market_cache
+                        }
+                        print(
+                            f"[SHADOW][WS] shared feeder supplied sports snapshot_tickers={len(ws_received_sports)}"
+                        )
+                        if len(ws_received_sports) < len(ws_sports_tickers):
+                            missing = sorted(
+                                [
+                                    str(t).strip().upper()
+                                    for t in ws_sports_tickers
+                                    if str(t).strip().upper() not in ws_received_sports
+                                ]
+                            )
+                            print(
+                                f"[SHADOW][WS] shared feeder missing sports tickers={len(missing)} "
+                                f"strict={shared_feed_strict} first5={missing[:5]}"
+                            )
+                    elif sports_ws_enabled and ws_sports_tickers:
+                        key_id_present = bool(str(os.environ.get("KALSHI_API_KEY_ID") or "").strip())
+                        private_key_inline = str(os.environ.get("KALSHI_API_PRIVATE_KEY") or "").strip()
+                        private_key_path = str(os.environ.get("KALSHI_PRIVATE_KEY_PATH") or "").strip()
+                        private_key_path_exists = bool(private_key_path and Path(private_key_path).exists())
+                        private_key_present = bool(private_key_inline or private_key_path_exists)
+                        if private_key_path and not private_key_inline and not private_key_path_exists:
+                            print(
+                                f"[SHADOW][WS] private key path missing on disk; "
+                                f"disabling private auth path={private_key_path}"
+                            )
+                        use_private_auth = _as_bool(cfg.get("sports_ws_use_private_auth"), default=False)
+                        if use_private_auth and not (key_id_present and private_key_present):
+                            use_private_auth = False
+                            print(
+                                "[SHADOW][WS] config requested private auth but credentials are incomplete; "
+                                "disabling private auth for this cycle"
+                            )
+                        if not use_private_auth and key_id_present and private_key_present:
+                            use_private_auth = True
+                            print("[SHADOW][WS] promoting private auth from env credentials")
+                        print(
+                            f"[SHADOW][WS] private_auth_effective={use_private_auth} "
+                            f"key_id_present={key_id_present} private_key_present={private_key_present}"
+                        )
+                        ws_quotes = _ws_ticker_snapshot(
+                            market_tickers=ws_sports_tickers,
+                            use_private_auth=use_private_auth,
+                            timeout_s=float(cfg.get("sports_ws_timeout_seconds", 15.0)),
+                            min_refresh_s=float(cfg.get("sports_ws_min_refresh_seconds", 2.0)),
+                        )
+                        print(f"[SHADOW][WS] sports snapshot_tickers={len(ws_quotes)}")
+                        if not ws_quotes:
+                            print("[SHADOW][WS] snapshot returned 0 sports tickers; forcing REST fallback")
+                        for mt, msg in ws_quotes.items():
+                            if not isinstance(msg, dict):
+                                continue
+                            ticker = str(mt).strip().upper()
+                            ws_received_sports.add(ticker)
+                            market_cache[ticker] = {
+                                "ticker": ticker,
+                                "yes_bid": safe_int(msg.get("yes_bid")),
+                                "yes_ask": safe_int(msg.get("yes_ask")),
+                                "no_bid": safe_int(msg.get("no_bid")),
+                                "no_ask": safe_int(msg.get("no_ask")),
+                                "status": "open",
+                            }
+                    elif not ws_sports_tickers:
+                        print("[SHADOW][WS] skipped sports snapshot (no open sports orders)")
 
-            if sports_ws_enabled and ws_sports_tickers:
-                for ticker in ws_sports_tickers:
-                    t = str(ticker).strip().upper()
-                    if not t:
-                        continue
-                    if t not in ws_received_sports:
+                    if sports_ws_enabled and ws_sports_tickers:
+                        for ticker in ws_sports_tickers:
+                            t = str(ticker).strip().upper()
+                            if not t:
+                                continue
+                            if t not in ws_received_sports:
+                                if shared_feed_path is not None and shared_feed_strict:
+                                    continue
+                                try:
+                                    market_cache[t] = _fetch_market(session=s, base_url=base_url, ticker=t)
+                                    print(
+                                        f"[SHADOW][WS] REST fallback for ws-miss ticker={t} "
+                                        f"yes_bid={safe_int(market_cache[t].get('yes_bid'))} "
+                                        f"yes_ask={safe_int(market_cache[t].get('yes_ask'))}"
+                                    )
+                                except Exception as exc:
+                                    print(f"[SHADOW][WS] REST fallback failed for ws-miss ticker={t} error={exc}")
+
+                    for ticker in ordered_needed_tickers:
+                        if ticker in market_cache:
+                            continue
                         if shared_feed_path is not None and shared_feed_strict:
                             continue
                         try:
-                            market_cache[t] = _fetch_market(session=s, base_url=base_url, ticker=t)
-                            print(
-                                f"[SHADOW][WS] REST fallback for ws-miss ticker={t} "
-                                f"yes_bid={safe_int(market_cache[t].get('yes_bid'))} "
-                                f"yes_ask={safe_int(market_cache[t].get('yes_ask'))}"
+                            market_cache[ticker] = _fetch_market(session=s, base_url=base_url, ticker=ticker)
+                        except Exception:
+                            continue
+
+                    if tickers_override:
+                        override_targets = [
+                            t
+                            for t in ordered_needed_tickers
+                            if any(
+                                str(t).startswith(str(prefix).strip().upper()) or str(prefix).strip().upper() in str(t)
+                                for prefix in tickers_override
+                                if str(prefix).strip()
                             )
-                        except Exception as exc:
-                            print(f"[SHADOW][WS] REST fallback failed for ws-miss ticker={t} error={exc}")
+                        ]
+                        for ticker in override_targets:
+                            if ticker in market_cache:
+                                continue
+                            if shared_feed_path is not None and shared_feed_strict:
+                                continue
+                            try:
+                                market_cache[ticker] = _fetch_market(session=s, base_url=base_url, ticker=ticker)
+                                print(
+                                    f"[SHADOW][WS] override REST fallback ticker={ticker} "
+                                    f"yes_bid={safe_int(market_cache[ticker].get('yes_bid'))} "
+                                    f"yes_ask={safe_int(market_cache[ticker].get('yes_ask'))}"
+                                )
+                            except Exception as exc:
+                                print(f"[SHADOW][WS] override REST fallback failed ticker={ticker} error={exc}")
 
-            for ticker in ordered_needed_tickers:
-                if ticker in market_cache:
-                    continue
-                if shared_feed_path is not None and shared_feed_strict:
-                    continue
-                try:
-                    market_cache[ticker] = _fetch_market(session=s, base_url=base_url, ticker=ticker)
-                except Exception:
-                    continue
-
-            if tickers_override:
-                override_targets = [
-                    t
-                    for t in ordered_needed_tickers
-                    if any(
-                        str(t).startswith(str(prefix).strip().upper()) or str(prefix).strip().upper() in str(t)
-                        for prefix in tickers_override
-                        if str(prefix).strip()
+                    _backfill_filled_order_close_times(
+                        orders=orders,
+                        market_cache=market_cache,
+                        session=s,
+                        base_url=base_url,
                     )
-                ]
-                for ticker in override_targets:
-                    if ticker in market_cache:
+                econ_state = _econ_pmf_state(config=cfg, econ_cache_dir=econ_cache_dir)
+
+                # Reprice / edge-gate still-open orders.
+                for order in orders:
+                    if str(order.get("status") or "") != "open":
                         continue
-                    if shared_feed_path is not None and shared_feed_strict:
-                        continue
-                    try:
-                        market_cache[ticker] = _fetch_market(session=s, base_url=base_url, ticker=ticker)
-                        print(
-                            f"[SHADOW][WS] override REST fallback ticker={ticker} "
-                            f"yes_bid={safe_int(market_cache[ticker].get('yes_bid'))} "
-                            f"yes_ask={safe_int(market_cache[ticker].get('yes_ask'))}"
+                    ticker = str(order.get("ticker") or "").strip().upper()
+                    market_lookup_ticker = str(order.get("_runtime_market_ticker") or ticker).strip().upper()
+                    market = market_cache.get(market_lookup_ticker)
+                    if not isinstance(market, dict):
+                        strategy_id = str(order.get("strategy_id") or "").strip()
+                        is_override_sports = bool(
+                            _is_sports_order(order)
+                            and tickers_override
+                            and any(
+                                market_lookup_ticker.startswith(str(prefix).strip().upper())
+                                or str(prefix).strip().upper() in market_lookup_ticker
+                                or ticker.startswith(str(prefix).strip().upper())
+                                or str(prefix).strip().upper() in ticker
+                                for prefix in tickers_override
+                                if str(prefix).strip()
+                            )
                         )
-                    except Exception as exc:
-                        print(f"[SHADOW][WS] override REST fallback failed ticker={ticker} error={exc}")
-
-            _backfill_filled_order_close_times(
-                orders=orders,
-                market_cache=market_cache,
-                session=s,
-                base_url=base_url,
-            )
-        econ_state = _econ_pmf_state(config=cfg, econ_cache_dir=econ_cache_dir)
-
-        # Reprice / edge-gate still-open orders.
-        for order in orders:
-            if str(order.get("status") or "") != "open":
-                continue
-            ticker = str(order.get("ticker") or "").strip().upper()
-            market_lookup_ticker = str(order.get("_runtime_market_ticker") or ticker).strip().upper()
-            market = market_cache.get(market_lookup_ticker)
-            if not isinstance(market, dict):
-                strategy_id = str(order.get("strategy_id") or "").strip()
-                is_override_sports = bool(
-                    _is_sports_order(order)
-                    and tickers_override
-                    and any(
-                        market_lookup_ticker.startswith(str(prefix).strip().upper())
-                        or str(prefix).strip().upper() in market_lookup_ticker
-                        or ticker.startswith(str(prefix).strip().upper())
-                        or str(prefix).strip().upper() in ticker
-                        for prefix in tickers_override
-                        if str(prefix).strip()
-                    )
-                )
-                if is_override_sports:
-                    synthetic_market = {
-                        "ticker": (market_lookup_ticker or ticker),
-                        "event_ticker": str(order.get("event_ticker") or "").strip().upper(),
-                        "title": str(order.get("title") or ""),
-                        "yes_bid": safe_int(order.get("yes_bid")),
-                        "yes_ask": safe_int(order.get("yes_ask")),
-                        "no_bid": safe_int(order.get("no_bid")),
-                        "no_ask": safe_int(order.get("no_ask")),
-                        "status": "open",
-                    }
-                    print(
-                        f"[SHADOW][WS] synthetic sports market fallback ticker={(market_lookup_ticker or ticker)} "
-                        f"strategy={strategy_id or 'NA'}"
-                    )
+                        if is_override_sports:
+                            synthetic_market = {
+                                "ticker": (market_lookup_ticker or ticker),
+                                "event_ticker": str(order.get("event_ticker") or "").strip().upper(),
+                                "title": str(order.get("title") or ""),
+                                "yes_bid": safe_int(order.get("yes_bid")),
+                                "yes_ask": safe_int(order.get("yes_ask")),
+                                "no_bid": safe_int(order.get("no_bid")),
+                                "no_ask": safe_int(order.get("no_ask")),
+                                "status": "open",
+                            }
+                            print(
+                                f"[SHADOW][WS] synthetic sports market fallback ticker={(market_lookup_ticker or ticker)} "
+                                f"strategy={strategy_id or 'NA'}"
+                            )
+                            _update_open_order_lifecycle(
+                                order=order,
+                                market=synthetic_market,
+                                config=cfg,
+                                weather_cache_dir=weather_cache_dir,
+                                econ_state=econ_state,
+                            )
+                        continue
                     _update_open_order_lifecycle(
                         order=order,
-                        market=synthetic_market,
+                        market=market,
                         config=cfg,
                         weather_cache_dir=weather_cache_dir,
                         econ_state=econ_state,
                     )
-                continue
-            _update_open_order_lifecycle(
-                order=order,
-                market=market,
-                config=cfg,
-                weather_cache_dir=weather_cache_dir,
-                econ_state=econ_state,
-            )
 
-        _prune_open_orders_by_event(
-            orders=orders,
-            max_open_orders_per_event=int(cfg.get("max_open_orders_per_event", 1)),
-        )
+                _prune_open_orders_by_event(
+                    orders=orders,
+                    max_open_orders_per_event=int(cfg.get("max_open_orders_per_event", 1)),
+                )
 
-        # Resolution grading for open/filled.
-        _grade_resolutions(
-            orders=orders,
-            market_cache=market_cache,
-            default_execution_mode=execution_mode,
-            maker_fee_rate=maker_fee_rate,
-            taker_fee_rate=taker_fee_rate,
-        )
+                # Resolution grading for open/filled.
+                _grade_resolutions(
+                    orders=orders,
+                    market_cache=market_cache,
+                    default_execution_mode=execution_mode,
+                    maker_fee_rate=maker_fee_rate,
+                    taker_fee_rate=taker_fee_rate,
+                )
 
-        state["orders"] = orders
-        state["updated_ts"] = _utc_now_iso()
-        _write_json(state_path, state)
-        ledger_path, summary_path = _save_outputs(
-            day=day,
-            state=state,
-            poll_seconds=sniper_poll_seconds,
-            max_runtime_minutes=max_runtime_minutes,
-            ledger_path=ledger_path,
-            summary_path=summary_path,
-        )
+                state["orders"] = orders
+                state["updated_ts"] = _utc_now_iso()
+                _write_json(state_path, state)
+                ledger_path, summary_path = _save_outputs(
+                    day=day,
+                    state=state,
+                    poll_seconds=sniper_poll_seconds,
+                    max_runtime_minutes=max_runtime_minutes,
+                    ledger_path=ledger_path,
+                    summary_path=summary_path,
+                )
 
-        current_sleep_seconds, poll_mode = _adaptive_poll_seconds(
-            orders=orders,
-            market_cache=market_cache,
-            config=cfg,
-            sniper_poll_seconds=sniper_poll_seconds,
-            needed_market_tickers=needed_market_tickers,
-        )
-        if poll_mode != last_poll_mode:
+                current_sleep_seconds, poll_mode = _adaptive_poll_seconds(
+                    orders=orders,
+                    market_cache=market_cache,
+                    config=cfg,
+                    sniper_poll_seconds=sniper_poll_seconds,
+                    needed_market_tickers=needed_market_tickers,
+                )
+                if poll_mode != last_poll_mode:
+                    print(
+                        f"[SHADOW][POLL] mode={poll_mode} sleep_s={current_sleep_seconds:.1f} "
+                        f"sniper_s={sniper_poll_seconds:.1f}"
+                    )
+                    last_poll_mode = poll_mode
+
+                if _all_done(orders):
+                    if orders or tickers_override:
+                        break
+                    print("[SHADOW][HEARTBEAT] no active orders yet; continuing discovery loop")
+                if not orders and not tickers_override:
+                    current_sleep_seconds = max(float(current_sleep_seconds), float(empty_discovery_cooldown_s))
+                if max_runtime_minutes > 0 and (time.monotonic() - start_monotonic) >= (max_runtime_minutes * 60.0):
+                    break
+                time.sleep(current_sleep_seconds)
+        except Exception as exc:
+            loop_error_count += 1
+            state["updated_ts"] = _utc_now_iso()
+            try:
+                _write_json(state_path, state)
+            except Exception as persist_exc:
+                print(
+                    f"[SHADOW][CRITICAL] cycle={cycle} state_persist_failed "
+                    f"error={type(persist_exc).__name__}: {persist_exc}"
+                )
             print(
-                f"[SHADOW][POLL] mode={poll_mode} sleep_s={current_sleep_seconds:.1f} "
-                f"sniper_s={sniper_poll_seconds:.1f}"
+                f"[SHADOW][CRITICAL] cycle={cycle} loop_errors={loop_error_count} "
+                f"unhandled_error={type(exc).__name__}: {exc}"
             )
-            last_poll_mode = poll_mode
-
-        if _all_done(orders):
-            if orders or tickers_override:
-                break
-            print("[SHADOW][HEARTBEAT] no active orders yet; continuing discovery loop")
-        if not orders and not tickers_override:
-            current_sleep_seconds = max(float(current_sleep_seconds), float(empty_discovery_cooldown_s))
-        if max_runtime_minutes > 0 and (time.monotonic() - start_monotonic) >= (max_runtime_minutes * 60.0):
-            break
-        time.sleep(current_sleep_seconds)
+            traceback.print_exc()
+            time.sleep(1.0)
+            continue
 
     # Final persist.
     state["updated_ts"] = _utc_now_iso()
