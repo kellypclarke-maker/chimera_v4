@@ -219,6 +219,21 @@ def _float_cfg(config: Mapping[str, object], key: str, default: float) -> float:
         return float(default)
 
 
+def _allowed_sportsbooks(config: Mapping[str, object]) -> set[str]:
+    raw = (
+        config.get("boltodds_allowed_sportsbooks")
+        or os.environ.get("BOLTODDS_ALLOWED_SPORTSBOOKS")
+        or "polymarket"
+    )
+    vals: list[str] = []
+    if isinstance(raw, str):
+        vals = [str(x).strip().lower() for x in str(raw).split(",") if str(x).strip()]
+    elif isinstance(raw, Sequence) and not isinstance(raw, (bytes, bytearray)):
+        vals = [str(x).strip().lower() for x in raw if str(x).strip()]
+    allowed = {v for v in vals if v and v not in {"*", "all", "any"}}
+    return allowed
+
+
 def _subscription_payload(config: Mapping[str, object]) -> Dict[str, object]:
     sub_payload = config.get("boltodds_subscribe_payload")
     if isinstance(sub_payload, str):
@@ -271,6 +286,28 @@ def _extract_error_message(raw_msg: object) -> Optional[str]:
     return None
 
 
+def _american_to_decimal(raw: object) -> Optional[float]:
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    try:
+        if s[0] in {"+", "-"}:
+            line = float(s)
+            if line > 0.0:
+                dec = 1.0 + (line / 100.0)
+                return dec if dec > 1.0 else None
+            if line < 0.0:
+                dec = 1.0 + (100.0 / abs(line))
+                return dec if dec > 1.0 else None
+            return None
+        v = float(s)
+    except Exception:
+        return None
+    if v > 1.0:
+        return float(v)
+    return None
+
+
 def _extract_decimal_odds(team_payload: Mapping[str, object]) -> Optional[float]:
     keys = ("odds_decimal", "decimal", "price_decimal", "ml_decimal")
     for k in keys:
@@ -281,6 +318,12 @@ def _extract_decimal_odds(team_payload: Mapping[str, object]) -> Optional[float]
                 continue
             if v > 1.0:
                 return v
+    # BoltOdds line_update schema uses American odds in the `odds` field (e.g. +108 / -113).
+    for k in ("odds", "american_odds", "line"):
+        if k in team_payload:
+            dec = _american_to_decimal(team_payload.get(k))
+            if dec is not None:
+                return dec
     return None
 
 
@@ -303,7 +346,20 @@ def _parse_msg_to_matchup(
     generation_id: int,
     seq_no: int,
 ) -> Optional[MatchupOdds]:
-    league_raw = str(payload.get("league") or payload.get("sport") or "").strip().upper()
+    action = str(payload.get("action") or "").strip().lower()
+    if action and action != "line_update":
+        return None
+
+    data = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
+    if not isinstance(data, Mapping):
+        return None
+
+    sportsbook = str(data.get("sportsbook") or "").strip().lower()
+    allowed_books = _allowed_sportsbooks(config)
+    if allowed_books and sportsbook and sportsbook not in allowed_books:
+        return None
+
+    league_raw = str(data.get("league") or data.get("sport") or "").strip().upper()
     if "NBA" in league_raw or league_raw == "BASKETBALL_NBA":
         league = "NBA"
         aliases = _NBA_ALIASES
@@ -313,8 +369,8 @@ def _parse_msg_to_matchup(
     else:
         return None
 
-    home_name = _normalize_team_name(payload.get("home_team") or payload.get("home") or payload.get("team_home"))
-    away_name = _normalize_team_name(payload.get("away_team") or payload.get("away") or payload.get("team_away"))
+    home_name = _normalize_team_name(data.get("home_team") or data.get("home") or data.get("team_home"))
+    away_name = _normalize_team_name(data.get("away_team") or data.get("away") or data.get("team_away"))
     if not home_name or not away_name:
         return None
 
@@ -326,16 +382,16 @@ def _parse_msg_to_matchup(
     home_odds = None
     away_odds = None
 
-    if isinstance(payload.get("home"), Mapping):
-        home_odds = _extract_decimal_odds(payload.get("home"))
-    if isinstance(payload.get("away"), Mapping):
-        away_odds = _extract_decimal_odds(payload.get("away"))
+    if isinstance(data.get("home"), Mapping):
+        home_odds = _extract_decimal_odds(data.get("home"))
+    if isinstance(data.get("away"), Mapping):
+        away_odds = _extract_decimal_odds(data.get("away"))
 
     if home_odds is None:
         for key in ("home_odds_decimal", "home_decimal", "home_price_decimal"):
-            if key in payload:
+            if key in data:
                 try:
-                    v = float(payload[key])
+                    v = float(data[key])
                 except Exception:
                     continue
                 if v > 1.0:
@@ -344,9 +400,9 @@ def _parse_msg_to_matchup(
 
     if away_odds is None:
         for key in ("away_odds_decimal", "away_decimal", "away_price_decimal"):
-            if key in payload:
+            if key in data:
                 try:
-                    v = float(payload[key])
+                    v = float(data[key])
                 except Exception:
                     continue
                 if v > 1.0:
@@ -354,12 +410,29 @@ def _parse_msg_to_matchup(
                     break
 
     if home_odds is None or away_odds is None:
-        outcomes = payload.get("outcomes")
-        if isinstance(outcomes, Sequence):
+        outcomes = data.get("outcomes")
+        if isinstance(outcomes, Mapping):
+            for row in outcomes.values():
+                if not isinstance(row, Mapping):
+                    continue
+                team_name = _normalize_team_name(
+                    row.get("outcome_target") or row.get("name") or row.get("team")
+                )
+                code = aliases.get(team_name)
+                dec = _extract_decimal_odds(row)
+                if dec is None:
+                    continue
+                if code == home_code:
+                    home_odds = dec
+                elif code == away_code:
+                    away_odds = dec
+        elif isinstance(outcomes, Sequence):
             for row in outcomes:
                 if not isinstance(row, Mapping):
                     continue
-                team_name = _normalize_team_name(row.get("name") or row.get("team"))
+                team_name = _normalize_team_name(
+                    row.get("outcome_target") or row.get("name") or row.get("team")
+                )
                 code = aliases.get(team_name)
                 dec = _extract_decimal_odds(row)
                 if dec is None:
@@ -382,7 +455,16 @@ def _parse_msg_to_matchup(
         str(away_code): float(p_away),
     }
 
-    commence_raw = str(payload.get("commence_time") or payload.get("start_time") or "").strip()
+    commence_raw = str(
+        data.get("commence_time")
+        or data.get("start_time")
+        or (
+            data.get("info", {}).get("when")
+            if isinstance(data.get("info"), Mapping)
+            else ""
+        )
+        or ""
+    ).strip()
     commence_iso = None
     if commence_raw:
         s = commence_raw
@@ -394,13 +476,29 @@ def _parse_msg_to_matchup(
                 d = d.replace(tzinfo=timezone.utc)
             commence_iso = d.astimezone(timezone.utc).isoformat()
         except Exception:
-            commence_iso = None
+            try:
+                # Example: "2026-02-28, 07:00 PM" from info.when
+                d_local = datetime.strptime(commence_raw, "%Y-%m-%d, %I:%M %p")
+                d_local = d_local.replace(tzinfo=timezone.utc)
+                commence_iso = d_local.isoformat()
+            except Exception:
+                commence_iso = None
 
     source_ts_ms = 0
+    ts_raw = str(payload.get("timestamp") or "").strip()
+    if ts_raw:
+        try:
+            ts_norm = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
+            ts_dt = datetime.fromisoformat(ts_norm)
+            if ts_dt.tzinfo is None:
+                ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+            source_ts_ms = int(ts_dt.timestamp() * 1000.0)
+        except Exception:
+            source_ts_ms = 0
     for ts_key in ("timestamp_ms", "ts", "updated_ms"):
-        if ts_key in payload:
+        if ts_key in data:
             try:
-                source_ts_ms = int(float(payload[ts_key]))
+                source_ts_ms = int(float(data[ts_key]))
                 break
             except Exception:
                 pass
@@ -409,7 +507,7 @@ def _parse_msg_to_matchup(
     stale_seconds = _float_cfg(config, "boltodds_stale_seconds", 5.0)
     lo, hi = sorted([home_code, away_code])
     matchup_key = f"{league}|{lo}|{hi}"
-    game_status = str(payload.get("game_status") or payload.get("status") or "unknown").strip().lower() or "unknown"
+    game_status = str(data.get("game_status") or data.get("status") or "unknown").strip().lower() or "unknown"
 
     return MatchupOdds(
         matchup_key=matchup_key,
