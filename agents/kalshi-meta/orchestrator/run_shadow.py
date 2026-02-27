@@ -329,6 +329,22 @@ def _runtime_category_for_fields(*, ticker: str, event_ticker: str, category: st
     return "Climate and Weather"
 
 
+def _dynamic_strategy_id_for_fields(*, ticker: str, event_ticker: str, category: str) -> str:
+    rep = _report_category_for_fields(ticker=ticker, event_ticker=event_ticker, category=category)
+    if rep == "NBA":
+        return "NBA_DYNAMIC"
+    if rep == "NHL":
+        return "NHL_DYNAMIC"
+    if rep == "CRYPTO":
+        return "CRYPTO_DYNAMIC"
+    cat_l = str(category or "").strip().lower()
+    if "econom" in cat_l:
+        return "ECON_DYNAMIC"
+    if "weather" in cat_l or "climate" in cat_l:
+        return "WEATHER_DYNAMIC"
+    return "SHADOW_DYNAMIC"
+
+
 def _infer_oracle_type(*, ticker: str, category: str) -> str:
     rep = _report_category_for_fields(ticker=ticker, event_ticker="", category=category)
     if rep == "NBA":
@@ -562,6 +578,13 @@ def _build_candidate_row_from_market(
     ticker = str(market.get("ticker") or "").strip().upper()
     if not ticker:
         return None
+    event_ticker = str(market.get("event_ticker") or "").strip().upper()
+    category_str = str(category or "")
+    strategy_id = _dynamic_strategy_id_for_fields(
+        ticker=ticker,
+        event_ticker=event_ticker,
+        category=category_str,
+    )
     yes_bid = safe_int(market.get("yes_bid"))
     yes_ask = safe_int(market.get("yes_ask"))
     no_bid = safe_int(market.get("no_bid"))
@@ -576,11 +599,11 @@ def _build_candidate_row_from_market(
     if extra_notes:
         notes += f";{extra_notes}"
     return {
-        "strategy_id": "",
+        "strategy_id": strategy_id,
         "ticker": ticker,
-        "event_ticker": str(market.get("event_ticker") or "").strip().upper(),
+        "event_ticker": event_ticker,
         "title": str(market.get("title") or "").strip(),
-        "category": str(category),
+        "category": category_str,
         "close_time": str(market.get("close_time") or market.get("expiration_time") or "").strip(),
         "action": "post_yes",
         "maker_or_taker": "maker",
@@ -1476,8 +1499,13 @@ def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], co
                             extra_notes="source=cli_tickers_override_direct_market",
                         )
                         if forced is None:
+                            forced_strategy = _dynamic_strategy_id_for_fields(
+                                ticker=ticker,
+                                event_ticker=event_ticker,
+                                category=category,
+                            )
                             forced = {
-                                "strategy_id": "",
+                                "strategy_id": forced_strategy,
                                 "ticker": ticker,
                                 "event_ticker": event_ticker,
                                 "title": "",
@@ -1549,8 +1577,13 @@ def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], co
                         extra_notes="source=cli_tickers_override_event_prefix",
                     )
                     if forced is None:
+                        forced_strategy = _dynamic_strategy_id_for_fields(
+                            ticker=ticker,
+                            event_ticker=str(market.get("event_ticker") or event_prefix),
+                            category=category,
+                        )
                         forced = {
-                            "strategy_id": "",
+                            "strategy_id": forced_strategy,
                             "ticker": ticker,
                             "event_ticker": str(market.get("event_ticker") or event_prefix),
                             "title": str(market.get("title") or ""),
@@ -1691,6 +1724,12 @@ def _migrate_order(order: Dict[str, Any], day: str) -> Dict[str, Any]:
     out.setdefault("shadow_order_id", shadow_order_id)
     out.setdefault("created_ts", _utc_now_iso())
     out.setdefault("strategy_id", str(out.get("strategy_id") or ""))
+    if not str(out.get("strategy_id") or "").strip():
+        out["strategy_id"] = _dynamic_strategy_id_for_fields(
+            ticker=ticker,
+            event_ticker=str(out.get("event_ticker") or ""),
+            category=str(out.get("category") or ""),
+        )
     out.setdefault("ticker", ticker)
     out.setdefault("event_ticker", str(out.get("event_ticker") or ""))
     out.setdefault("category", str(out.get("category") or ""))
@@ -1757,11 +1796,18 @@ def _build_order_from_candidate(*, row: Dict[str, str], day: str, size_contracts
 
     initial_p_true = _p_true_from_candidate_row(row)
     initial_ev = _parse_float(row.get("ev_dollars"))
+    strategy_id = str(row.get("strategy_id") or "").strip()
+    if not strategy_id:
+        strategy_id = _dynamic_strategy_id_for_fields(
+            ticker=ticker,
+            event_ticker=str(row.get("event_ticker") or ""),
+            category=str(row.get("category") or ""),
+        )
 
     order: Dict[str, Any] = {
         "shadow_order_id": _make_shadow_order_id(day, ticker),
         "created_ts": now_iso,
-        "strategy_id": str(row.get("strategy_id") or ""),
+        "strategy_id": strategy_id,
         "ticker": ticker,
         "event_ticker": str(row.get("event_ticker") or ""),
         "category": _runtime_category_for_fields(
