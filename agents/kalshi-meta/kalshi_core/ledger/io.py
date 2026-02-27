@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import os
 from pathlib import Path
 from typing import Dict, Iterable
 
@@ -28,6 +29,18 @@ def load_ledger(path: Path) -> Dict[str, dict]:
     return out
 
 
+def _atomic_write_rows(path: Path, rows: Iterable[dict]) -> None:
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=SHADOW_LEDGER_HEADERS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def upsert_rows(path: Path, rows: Iterable[dict]) -> None:
     init_shadow_ledger(path)
     existing = load_ledger(path)
@@ -42,10 +55,4 @@ def upsert_rows(path: Path, rows: Iterable[dict]) -> None:
         existing.values(),
         key=lambda r: (str(r.get("created_ts") or ""), str(r.get("shadow_order_id") or "")),
     )
-
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=SHADOW_LEDGER_HEADERS)
-        writer.writeheader()
-        for row in ordered:
-            writer.writerow(row)
-
+    _atomic_write_rows(path, ordered)
