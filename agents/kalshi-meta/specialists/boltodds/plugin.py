@@ -223,7 +223,7 @@ def _allowed_sportsbooks(config: Mapping[str, object]) -> set[str]:
     raw = (
         config.get("boltodds_allowed_sportsbooks")
         or os.environ.get("BOLTODDS_ALLOWED_SPORTSBOOKS")
-        or "polymarket"
+        or "pinnacle,draftkings"
     )
     vals: list[str] = []
     if isinstance(raw, str):
