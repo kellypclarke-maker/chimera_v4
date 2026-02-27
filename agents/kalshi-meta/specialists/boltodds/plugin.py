@@ -15,10 +15,6 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import websockets
 
-from specialists.nba.plugin import _NBA_TEAM_CODE_TO_NAME
-from specialists.nhl.plugin import _NHL_TEAM_CODE_TO_NAME
-
-
 class ListenerState(str, Enum):
     BOOTING = "BOOTING"
     CONNECTING = "CONNECTING"
@@ -59,6 +55,74 @@ class OddsSnapshot:
 _NBA_EVENT_RE = re.compile(r"^KXNBAGAME-(?P<date>\d{2}[A-Z]{3}\d{2})(?P<pair>[A-Z]{6})(?:-(?P<side>[A-Z]{3}))?$")
 _NHL_EVENT_RE = re.compile(r"^KXNHLGAME-(?P<date>\d{2}[A-Z]{3}\d{2})(?P<pair>[A-Z]{6})(?:-(?P<side>[A-Z]{3}))?$")
 
+_NBA_TEAM_CODE_TO_NAME: Dict[str, str] = {
+    "ATL": "Atlanta Hawks",
+    "BKN": "Brooklyn Nets",
+    "BOS": "Boston Celtics",
+    "CHA": "Charlotte Hornets",
+    "CHI": "Chicago Bulls",
+    "CLE": "Cleveland Cavaliers",
+    "DAL": "Dallas Mavericks",
+    "DEN": "Denver Nuggets",
+    "DET": "Detroit Pistons",
+    "GSW": "Golden State Warriors",
+    "HOU": "Houston Rockets",
+    "IND": "Indiana Pacers",
+    "LAC": "Los Angeles Clippers",
+    "LAL": "Los Angeles Lakers",
+    "MEM": "Memphis Grizzlies",
+    "MIA": "Miami Heat",
+    "MIL": "Milwaukee Bucks",
+    "MIN": "Minnesota Timberwolves",
+    "NOP": "New Orleans Pelicans",
+    "NYK": "New York Knicks",
+    "OKC": "Oklahoma City Thunder",
+    "ORL": "Orlando Magic",
+    "PHI": "Philadelphia 76ers",
+    "PHX": "Phoenix Suns",
+    "POR": "Portland Trail Blazers",
+    "SAC": "Sacramento Kings",
+    "SAS": "San Antonio Spurs",
+    "TOR": "Toronto Raptors",
+    "UTA": "Utah Jazz",
+    "WAS": "Washington Wizards",
+}
+
+_NHL_TEAM_CODE_TO_NAME: Dict[str, str] = {
+    "ANA": "Anaheim Ducks",
+    "BOS": "Boston Bruins",
+    "BUF": "Buffalo Sabres",
+    "CAR": "Carolina Hurricanes",
+    "CBJ": "Columbus Blue Jackets",
+    "CGY": "Calgary Flames",
+    "CHI": "Chicago Blackhawks",
+    "COL": "Colorado Avalanche",
+    "DAL": "Dallas Stars",
+    "DET": "Detroit Red Wings",
+    "EDM": "Edmonton Oilers",
+    "FLA": "Florida Panthers",
+    "LAK": "Los Angeles Kings",
+    "MIN": "Minnesota Wild",
+    "MTL": "Montreal Canadiens",
+    "NJD": "New Jersey Devils",
+    "NSH": "Nashville Predators",
+    "NYI": "New York Islanders",
+    "NYR": "New York Rangers",
+    "OTT": "Ottawa Senators",
+    "PHI": "Philadelphia Flyers",
+    "PIT": "Pittsburgh Penguins",
+    "SEA": "Seattle Kraken",
+    "SJS": "San Jose Sharks",
+    "STL": "St. Louis Blues",
+    "TBL": "Tampa Bay Lightning",
+    "TOR": "Toronto Maple Leafs",
+    "UTA": "Utah Hockey Club",
+    "VAN": "Vancouver Canucks",
+    "VGK": "Vegas Golden Knights",
+    "WSH": "Washington Capitals",
+    "WPG": "Winnipeg Jets",
+}
+
 
 def _normalize_team_name(raw: object) -> str:
     s = re.sub(r"[^a-z0-9]+", " ", str(raw or "").strip().lower()).strip()
@@ -67,20 +131,57 @@ def _normalize_team_name(raw: object) -> str:
 
 def _build_alias_map(code_to_name: Mapping[str, str]) -> Dict[str, str]:
     out: Dict[str, str] = {}
+    nicknames: Dict[str, list[str]] = {}
     for code, name in code_to_name.items():
         norm = _normalize_team_name(name)
         if norm:
             out[norm] = str(code).strip().upper()
+            parts = norm.split()
+            if len(parts) >= 2:
+                nickname = " ".join(parts[1:])
+                nicknames.setdefault(nickname, []).append(str(code).strip().upper())
+                out.setdefault(parts[-1], str(code).strip().upper())
+                out.setdefault(nickname, str(code).strip().upper())
+            if norm.startswith("los angeles "):
+                suffix = norm[len("los angeles ") :]
+                out[f"la {suffix}"] = str(code).strip().upper()
+                out[f"l a {suffix}"] = str(code).strip().upper()
+            if norm.startswith("new york "):
+                suffix = norm[len("new york ") :]
+                out[f"ny {suffix}"] = str(code).strip().upper()
+            if norm.startswith("new jersey "):
+                suffix = norm[len("new jersey ") :]
+                out[f"nj {suffix}"] = str(code).strip().upper()
+            if norm.startswith("oklahoma city "):
+                suffix = norm[len("oklahoma city ") :]
+                out[f"okc {suffix}"] = str(code).strip().upper()
+    for nickname, codes in nicknames.items():
+        if len(set(codes)) == 1:
+            out[nickname] = list(set(codes))[0]
     aliases = {
         "new jersey": "NJD",
         "new york rangers": "NYR",
         "new york islanders": "NYI",
+        "new york knicks": "NYK",
+        "brooklyn nets": "BKN",
+        "boston celtics": "BOS",
+        "cleveland cavaliers": "CLE",
+        "denver nuggets": "DEN",
+        "detroit pistons": "DET",
         "los angeles clippers": "LAC",
         "la clippers": "LAC",
+        "los angeles lakers": "LAL",
+        "la lakers": "LAL",
         "philadelphia 76ers": "PHI",
+        "philadelphia seventy sixers": "PHI",
         "76ers": "PHI",
         "tampa bay": "TBL",
         "los angeles kings": "LAK",
+        "san jose sharks": "SJS",
+        "st louis blues": "STL",
+        "vegas golden knights": "VGK",
+        "utah hockey club": "UTA",
+        "utah jazz": "UTA",
     }
     for alias, code in aliases.items():
         if code in code_to_name:
@@ -90,6 +191,9 @@ def _build_alias_map(code_to_name: Mapping[str, str]) -> Dict[str, str]:
 
 _NBA_ALIASES = _build_alias_map(_NBA_TEAM_CODE_TO_NAME)
 _NHL_ALIASES = _build_alias_map(_NHL_TEAM_CODE_TO_NAME)
+_TEAM_NAME_MISS_LOGGED: set[tuple[str, str]] = set()
+_PARTIAL_LINES_LOCK = threading.Lock()
+_PARTIAL_LINES: Dict[Tuple[str, str, str], Dict[str, object]] = {}
 
 
 class AtomicOddsStore:
@@ -339,6 +443,59 @@ def _calc_pair_probabilities(odds_a: float, odds_b: float) -> Optional[Tuple[flo
         return None
 
 
+def _log_name_miss_once(*, league: str, team_name: str) -> None:
+    key = (str(league or "").strip().upper(), _normalize_team_name(team_name))
+    if not key[1]:
+        return
+    if key in _TEAM_NAME_MISS_LOGGED:
+        return
+    _TEAM_NAME_MISS_LOGGED.add(key)
+    print(f"[SHADOW][ORACLE] BoltOdds unmapped_team league={key[0]} name={team_name}")
+
+
+def _update_partial_line(
+    *,
+    league: str,
+    sportsbook: str,
+    home_code: str,
+    away_code: str,
+    home_odds: Optional[float],
+    away_odds: Optional[float],
+    commence_time_utc: Optional[str],
+    game_status: str,
+    source_ts_ms: int,
+) -> Tuple[Optional[float], Optional[float], Optional[str], str, int]:
+    lo, hi = sorted([str(home_code).strip().upper(), str(away_code).strip().upper()])
+    cache_key = (str(league).strip().upper(), f"{lo}|{hi}", str(sportsbook or "").strip().lower())
+    with _PARTIAL_LINES_LOCK:
+        prev = _PARTIAL_LINES.get(cache_key, {})
+        merged: Dict[str, object] = dict(prev)
+        merged["league"] = str(league).strip().upper()
+        merged["home_code"] = str(home_code).strip().upper()
+        merged["away_code"] = str(away_code).strip().upper()
+        if home_odds is not None:
+            merged["home_odds"] = float(home_odds)
+        if away_odds is not None:
+            merged["away_odds"] = float(away_odds)
+        if commence_time_utc:
+            merged["commence_time_utc"] = str(commence_time_utc)
+        merged["game_status"] = str(game_status or merged.get("game_status") or "unknown").strip().lower() or "unknown"
+        merged["source_ts_ms"] = max(int(source_ts_ms or 0), int(merged.get("source_ts_ms") or 0))
+        _PARTIAL_LINES[cache_key] = merged
+        return (
+            (float(merged["home_odds"]) if "home_odds" in merged else None),
+            (float(merged["away_odds"]) if "away_odds" in merged else None),
+            (str(merged.get("commence_time_utc") or "") or None),
+            str(merged.get("game_status") or "unknown").strip().lower() or "unknown",
+            int(merged.get("source_ts_ms") or 0),
+        )
+
+
+def _reset_partial_lines() -> None:
+    with _PARTIAL_LINES_LOCK:
+        _PARTIAL_LINES.clear()
+
+
 def _parse_msg_to_matchup(
     *,
     payload: Mapping[str, object],
@@ -376,6 +533,10 @@ def _parse_msg_to_matchup(
 
     home_code = aliases.get(home_name)
     away_code = aliases.get(away_name)
+    if not home_code:
+        _log_name_miss_once(league=league, team_name=str(data.get("home_team") or data.get("home") or data.get("team_home") or ""))
+    if not away_code:
+        _log_name_miss_once(league=league, team_name=str(data.get("away_team") or data.get("away") or data.get("team_away") or ""))
     if not home_code or not away_code:
         return None
 
@@ -442,19 +603,6 @@ def _parse_msg_to_matchup(
                 elif code == away_code:
                     away_odds = dec
 
-    if home_odds is None or away_odds is None:
-        return None
-
-    probs = _calc_pair_probabilities(home_odds, away_odds)
-    if probs is None:
-        return None
-
-    p_home, p_away = probs
-    p_true_by_team: Dict[str, float] = {
-        str(home_code): float(p_home),
-        str(away_code): float(p_away),
-    }
-
     commence_raw = str(
         data.get("commence_time")
         or data.get("start_time")
@@ -505,9 +653,32 @@ def _parse_msg_to_matchup(
 
     now_mono = time.monotonic()
     stale_seconds = _float_cfg(config, "boltodds_stale_seconds", 5.0)
+    home_odds, away_odds, commence_iso, game_status, source_ts_ms = _update_partial_line(
+        league=league,
+        sportsbook=sportsbook,
+        home_code=home_code,
+        away_code=away_code,
+        home_odds=home_odds,
+        away_odds=away_odds,
+        commence_time_utc=commence_iso,
+        game_status=str(data.get("game_status") or data.get("status") or "unknown").strip().lower() or "unknown",
+        source_ts_ms=source_ts_ms,
+    )
+    if home_odds is None or away_odds is None:
+        return None
+
+    probs = _calc_pair_probabilities(home_odds, away_odds)
+    if probs is None:
+        return None
+
+    p_home, p_away = probs
+    p_true_by_team: Dict[str, float] = {
+        str(home_code): float(p_home),
+        str(away_code): float(p_away),
+    }
+
     lo, hi = sorted([home_code, away_code])
     matchup_key = f"{league}|{lo}|{hi}"
-    game_status = str(data.get("game_status") or data.get("status") or "unknown").strip().lower() or "unknown"
 
     return MatchupOdds(
         matchup_key=matchup_key,
@@ -530,6 +701,7 @@ async def _listener_loop(config: Mapping[str, object], stop_event: threading.Eve
     backoff = 1.0
     while not stop_event.is_set():
         generation += 1
+        _reset_partial_lines()
         ws_url = _ws_url(config)
         api_key = _api_key(config)
         if not ws_url or not api_key:
@@ -633,6 +805,7 @@ async def _listener_loop(config: Mapping[str, object], stop_event: threading.Eve
             await asyncio.sleep(min(30.0, backoff + jitter))
             backoff = min(30.0, backoff * 2.0)
 
+    _reset_partial_lines()
     _STORE.set_state(ListenerState.STOPPED)
 
 
