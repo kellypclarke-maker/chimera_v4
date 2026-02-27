@@ -498,8 +498,33 @@ def _ws_ticker_snapshot(
             _WS_SNAPSHOT_CACHE_QUOTES = {k: dict(v) for k, v in out.items()}
             _WS_SNAPSHOT_CACHE_TS_MONO = now_mono
         return out
-    except Exception:
-        print("[SHADOW][WS] snapshot failed; falling back to REST")
+    except Exception as exc:
+        if bool(use_private_auth):
+            print(
+                f"[SHADOW][WS] snapshot failed with private auth; "
+                f"retrying public ws ({type(exc).__name__}: {exc})"
+            )
+            try:
+                out = asyncio.run(
+                    ws_collect_ticker_snapshot(
+                        market_tickers=tickers,
+                        use_private_auth=False,
+                        timeout_s=max(0.5, float(timeout_s)),
+                    )
+                )
+                print(f"[SHADOW][WS] snapshot received via public ws={len(out)}")
+                if out:
+                    _WS_SNAPSHOT_CACHE_TICKERS = tuple(tickers)
+                    _WS_SNAPSHOT_CACHE_QUOTES = {k: dict(v) for k, v in out.items()}
+                    _WS_SNAPSHOT_CACHE_TS_MONO = now_mono
+                return out
+            except Exception as exc_public:
+                print(
+                    f"[SHADOW][WS] snapshot failed on public retry "
+                    f"({type(exc_public).__name__}: {exc_public}); falling back to REST"
+                )
+                return {}
+        print(f"[SHADOW][WS] snapshot failed; falling back to REST ({type(exc).__name__}: {exc})")
         return {}
 
 

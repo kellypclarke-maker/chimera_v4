@@ -106,12 +106,33 @@ class KalshiWsClient:
             )
         else:
             print(f"[KALSHI_WS] connecting url={self.ws_url} private_auth=0")
+        connect_kwargs: Dict[str, Any] = {
+            "ping_interval": None,
+            "close_timeout": 5,
+            "open_timeout": 10,
+        }
+        # websockets API changed across versions:
+        # - newer: additional_headers
+        # - older: extra_headers
+        # Keep both paths to avoid silent snapshot failures on older VM envs.
+        if headers is not None:
+            try:
+                self._ws = await websockets.connect(
+                    self.ws_url,
+                    additional_headers=headers,
+                    **connect_kwargs,
+                )
+                return
+            except TypeError:
+                self._ws = await websockets.connect(
+                    self.ws_url,
+                    extra_headers=headers,
+                    **connect_kwargs,
+                )
+                return
         self._ws = await websockets.connect(
             self.ws_url,
-            additional_headers=headers,
-            ping_interval=None,
-            close_timeout=5,
-            open_timeout=10,
+            **connect_kwargs,
         )
 
     async def close(self) -> None:
