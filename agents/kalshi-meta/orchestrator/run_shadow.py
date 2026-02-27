@@ -3867,10 +3867,15 @@ def main() -> int:
             ws_received_sports: set[str] = set()
             if sports_ws_enabled and ws_sports_tickers:
                 key_id_present = bool(str(os.environ.get("KALSHI_API_KEY_ID") or "").strip())
-                private_key_present = bool(
-                    str(os.environ.get("KALSHI_API_PRIVATE_KEY") or "").strip()
-                    or str(os.environ.get("KALSHI_PRIVATE_KEY_PATH") or "").strip()
-                )
+                private_key_inline = str(os.environ.get("KALSHI_API_PRIVATE_KEY") or "").strip()
+                private_key_path = str(os.environ.get("KALSHI_PRIVATE_KEY_PATH") or "").strip()
+                private_key_path_exists = bool(private_key_path and Path(private_key_path).exists())
+                private_key_present = bool(private_key_inline or private_key_path_exists)
+                if private_key_path and not private_key_inline and not private_key_path_exists:
+                    print(
+                        f"[SHADOW][WS] private key path missing on disk; "
+                        f"disabling private auth path={private_key_path}"
+                    )
                 use_private_auth = _as_bool(cfg.get("sports_ws_use_private_auth"), default=False)
                 if not use_private_auth and key_id_present and private_key_present:
                     use_private_auth = True
