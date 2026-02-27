@@ -195,46 +195,96 @@ def main() -> int:
     print(f"[AB] output_dir={out_root}")
     print(f"[AB] feeder_feed_path={feed_path}")
 
-    feeder_proc: Optional[subprocess.Popen] = None
-    control_proc: Optional[subprocess.Popen] = None
-    experiment_proc: Optional[subprocess.Popen] = None
+    max_restarts = 3
+    restart_cooldown_s = 5.0
+    role_specs: dict[str, dict[str, object]] = {
+        "feeder": {
+            "cmd": feeder_cmd,
+            "log_path": out_root / "shared_feeder.log",
+            "proc": None,
+            "restarts": 0,
+        },
+        "control": {
+            "cmd": control_cmd,
+            "log_path": out_root / "control.log",
+            "proc": None,
+            "restarts": 0,
+        },
+        "experiment": {
+            "cmd": experiment_cmd,
+            "log_path": out_root / "experiment.log",
+            "proc": None,
+            "restarts": 0,
+        },
+    }
 
     try:
-        feeder_proc = _start_process(feeder_cmd, log_path=out_root / "shared_feeder.log", env=subprocess_env)
+        role_specs["feeder"]["proc"] = _start_process(
+            feeder_cmd,
+            log_path=Path(role_specs["feeder"]["log_path"]),
+            env=subprocess_env,
+        )
         time.sleep(1.0)
-        control_proc = _start_process(control_cmd, log_path=out_root / "control.log", env=subprocess_env)
+        role_specs["control"]["proc"] = _start_process(
+            control_cmd,
+            log_path=Path(role_specs["control"]["log_path"]),
+            env=subprocess_env,
+        )
         time.sleep(1.0)
-        experiment_proc = _start_process(experiment_cmd, log_path=out_root / "experiment.log", env=subprocess_env)
+        role_specs["experiment"]["proc"] = _start_process(
+            experiment_cmd,
+            log_path=Path(role_specs["experiment"]["log_path"]),
+            env=subprocess_env,
+        )
 
         print(
-            f"[AB] processes started feeder_pid={feeder_proc.pid} "
-            f"control_pid={control_proc.pid} experiment_pid={experiment_proc.pid}"
+            f"[AB] processes started feeder_pid={role_specs['feeder']['proc'].pid} "
+            f"control_pid={role_specs['control']['proc'].pid} "
+            f"experiment_pid={role_specs['experiment']['proc'].pid}"
         )
 
         while True:
-            feeder_rc = feeder_proc.poll() if feeder_proc is not None else 0
-            control_rc = control_proc.poll() if control_proc is not None else 0
-            experiment_rc = experiment_proc.poll() if experiment_proc is not None else 0
-
-            if feeder_rc is not None and feeder_rc != 0:
-                print(f"[AB] feeder exited unexpectedly rc={feeder_rc}")
-                return int(feeder_rc)
-            if control_rc is not None:
-                print(f"[AB] control exited rc={control_rc}")
-                return int(control_rc)
-            if experiment_rc is not None:
-                print(f"[AB] experiment exited rc={experiment_rc}")
-                return int(experiment_rc)
-
+            restarted = False
+            for role, spec in role_specs.items():
+                proc = spec.get("proc")
+                if not isinstance(proc, subprocess.Popen):
+                    continue
+                rc = proc.poll()
+                if rc is None:
+                    continue
+                restarts = int(spec.get("restarts") or 0)
+                print(f"[AB] {role} exited rc={rc} restart_count={restarts}")
+                _terminate_process(proc, name=role)
+                if restarts >= max_restarts:
+                    print(
+                        f"[AB][CRITICAL] {role} exceeded max_restarts={max_restarts}; "
+                        "shutting down fleet"
+                    )
+                    return int(rc or 1)
+                print(
+                    f"[AB] restarting role={role} cooldown_s={restart_cooldown_s:.1f} "
+                    f"next_restart={restarts + 1}/{max_restarts}"
+                )
+                time.sleep(restart_cooldown_s)
+                spec["restarts"] = restarts + 1
+                spec["proc"] = _start_process(
+                    spec["cmd"],
+                    log_path=Path(spec["log_path"]),
+                    env=subprocess_env,
+                )
+                restarted = True
+                break
+            if restarted:
+                continue
             time.sleep(1.0)
 
     except KeyboardInterrupt:
         print("[AB] interrupted")
         return 130
     finally:
-        _terminate_process(experiment_proc, name="experiment")
-        _terminate_process(control_proc, name="control")
-        _terminate_process(feeder_proc, name="shared_feeder")
+        _terminate_process(role_specs["experiment"].get("proc"), name="experiment")
+        _terminate_process(role_specs["control"].get("proc"), name="control")
+        _terminate_process(role_specs["feeder"].get("proc"), name="feeder")
 
 
 if __name__ == "__main__":
