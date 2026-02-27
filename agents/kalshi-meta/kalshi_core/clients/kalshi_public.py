@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 import re
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
@@ -18,6 +19,10 @@ _DATE_TOKEN_FULL_RE = re.compile(r"^\d{2}[A-Z]{3}\d{2}$")
 _SERIES_DATE_PREFIX_RE = re.compile(r"^(?P<series>[A-Z0-9]+)-(?P<date>\d{2}[A-Z]{3}\d{2})(?:$|-)")
 _DEBUG_PREFIX = "[KALSHI_DEBUG]"
 _DEBUG_PAYLOAD_CHARS = 500
+_RATE_LIMIT_BASE_BACKOFF_S = 1.0
+_RATE_LIMIT_MAX_BACKOFF_S = 64.0
+_rate_limit_until_monotonic = 0.0
+_rate_limit_next_backoff_s = _RATE_LIMIT_BASE_BACKOFF_S
 
 
 def _debug(msg: str) -> None:
@@ -42,6 +47,69 @@ def _response_payload_preview(resp: requests.Response, *, limit: int = _DEBUG_PA
     if one_line:
         return one_line[: max(1, int(limit))]
     return "<empty>"
+
+
+def _parse_retry_after_seconds(raw: object) -> Optional[float]:
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    try:
+        v = float(s)
+    except Exception:
+        return None
+    if v <= 0.0:
+        return None
+    return float(v)
+
+
+def _extract_http_status_from_exc(exc: BaseException) -> Optional[int]:
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    if status is not None:
+        try:
+            return int(status)
+        except Exception:
+            pass
+    msg = str(exc)
+    if "429" in msg:
+        return 429
+    return None
+
+
+def _extract_retry_after_from_exc(exc: BaseException) -> str:
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None)
+    if headers is None:
+        return ""
+    return str(headers.get("Retry-After") or headers.get("retry-after") or "").strip()
+
+
+def _respect_rate_limit_cooldown() -> None:
+    wait_s = float(_rate_limit_until_monotonic - time.monotonic())
+    if wait_s > 0.0:
+        _debug(f"rate_limit_global_cooldown sleep_s={wait_s:.2f}")
+        time.sleep(wait_s)
+
+
+def _note_rate_limited(*, retry_after_header: str = "") -> float:
+    global _rate_limit_until_monotonic, _rate_limit_next_backoff_s
+    parsed = _parse_retry_after_seconds(retry_after_header)
+    if parsed is None:
+        wait_s = float(_rate_limit_next_backoff_s)
+        _rate_limit_next_backoff_s = min(
+            float(_RATE_LIMIT_MAX_BACKOFF_S),
+            max(float(_RATE_LIMIT_BASE_BACKOFF_S), float(_rate_limit_next_backoff_s) * 2.0),
+        )
+    else:
+        wait_s = min(float(_RATE_LIMIT_MAX_BACKOFF_S), max(float(_RATE_LIMIT_BASE_BACKOFF_S), float(parsed)))
+        _rate_limit_next_backoff_s = min(float(_RATE_LIMIT_MAX_BACKOFF_S), wait_s * 2.0)
+    _rate_limit_until_monotonic = max(float(_rate_limit_until_monotonic), time.monotonic() + wait_s)
+    return wait_s
+
+
+def _reset_rate_limit_backoff() -> None:
+    global _rate_limit_next_backoff_s
+    _rate_limit_next_backoff_s = float(_RATE_LIMIT_BASE_BACKOFF_S)
 
 
 def canonical_kalshi_base(base_url: Optional[str] = None) -> str:
@@ -141,11 +209,21 @@ def _fetch_series_events(
                 params["cursor"] = cursor
             _debug(f"GET {base}/events params={params}")
             try:
+                _respect_rate_limit_cooldown()
                 resp = get_with_retries(session, f"{base}/events", params=params, timeout_s=20.0)
                 resp.raise_for_status()
             except Exception as exc:
+                status_code = _extract_http_status_from_exc(exc)
+                if status_code == 429:
+                    wait_s = _note_rate_limited(retry_after_header=_extract_retry_after_from_exc(exc))
+                    _debug(
+                        f"request rate_limited url={base}/events status={status or '<none>'} "
+                        f"cooldown_s={wait_s:.2f} series={series}"
+                    )
+                    return out
                 _debug(f"request failed url={base}/events status={status or '<none>'} error={exc}")
                 break
+            _reset_rate_limit_backoff()
             _debug(
                 f"response status={resp.status_code} url={resp.url} "
                 f"payload={_response_payload_preview(resp)}"
@@ -391,8 +469,18 @@ def fetch_event(
         return {}
     url = f"{base}/events/{et}"
     _debug(f"GET {url}")
-    resp = get_with_retries(session, url, timeout_s=20.0)
-    resp.raise_for_status()
+    try:
+        _respect_rate_limit_cooldown()
+        resp = get_with_retries(session, url, timeout_s=20.0)
+        resp.raise_for_status()
+    except Exception as exc:
+        status_code = _extract_http_status_from_exc(exc)
+        if status_code == 429:
+            wait_s = _note_rate_limited(retry_after_header=_extract_retry_after_from_exc(exc))
+            _debug(f"fetch_event rate_limited event_ticker={et} cooldown_s={wait_s:.2f}")
+            return {}
+        raise
+    _reset_rate_limit_backoff()
     _debug(f"response status={resp.status_code} url={resp.url} payload={_response_payload_preview(resp)}")
     payload = resp.json() if resp.content else {}
     if not isinstance(payload, dict):

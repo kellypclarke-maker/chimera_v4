@@ -105,10 +105,13 @@ _WS_SNAPSHOT_CACHE_TICKERS: Tuple[str, ...] = ()
 _WS_SNAPSHOT_CACHE_QUOTES: Dict[str, Dict[str, Any]] = {}
 _WS_SNAPSHOT_CACHE_TS_MONO: float = 0.0
 _HF_BENCHMARK_TICKER_DEFAULT = "KXNBAGAME-26FEB26MINLAC-MIN"
+_LAST_EVENTS_PREVIEW_TS_MONO: float = 0.0
 _SENTINEL_POLL_SECONDS = 60.0
 _PREGAME_POLL_SECONDS = 5.0
 _PREGAME_WINDOW_SECONDS = 2.0 * 60.0 * 60.0
 _SNIPER_WINDOW_SECONDS = 60.0 * 60.0
+_DISCOVERY_STAGGER_SECONDS_DEFAULT = 0.75
+_EMPTY_DISCOVERY_COOLDOWN_SECONDS_DEFAULT = 45.0
 _CLOSED_MARKET_STATUSES = {
     "closed",
     "final",
@@ -635,11 +638,24 @@ def _discover_open_sports_market_tickers_from_markets_endpoint(
     date_token: str,
     max_pages: int,
     page_limit: int,
+    series_stagger_seconds: float = _DISCOVERY_STAGGER_SECONDS_DEFAULT,
 ) -> List[str]:
     token = str(date_token or "").strip().upper()
     base = str(base_url or "").strip().rstrip("/") or DEFAULT_BASE
     limit = max(1, min(int(page_limit), 1000))
     out: set[str] = set()
+
+    def _retry_after_seconds(resp: requests.Response, attempt: int) -> float:
+        raw = str(resp.headers.get("Retry-After") or resp.headers.get("retry-after") or "").strip()
+        if raw:
+            try:
+                parsed = float(raw)
+                if parsed > 0.0:
+                    return min(60.0, max(0.5, parsed))
+            except Exception:
+                pass
+        return min(60.0, float(2 ** max(0, int(attempt))))
+
     def _scan_pass(*, series_ticker: str, pages_limit: int) -> None:
         cursor = ""
         pages = 0
@@ -654,22 +670,54 @@ def _discover_open_sports_market_tickers_from_markets_endpoint(
             if cursor:
                 params["cursor"] = cursor
             url = f"{base}/markets"
-            try:
-                resp = session.get(url, params=params, timeout=20.0)
-                if with_status_filter and int(resp.status_code) >= 400:
+            payload: Dict[str, Any] = {}
+            request_ok = False
+            attempts = 0
+            while attempts < 4:
+                attempts += 1
+                try:
+                    resp = session.get(url, params=params, timeout=20.0)
+                except Exception as exc:
+                    print(
+                        f"[SHADOW][DISCOVERY] /markets sports fetch failed "
+                        f"series={series or 'ALL'} page={pages + 1} error={exc}"
+                    )
+                    break
+                status_code = int(resp.status_code)
+                if status_code == 429:
+                    wait_s = _retry_after_seconds(resp, attempts - 1)
+                    if attempts < 4:
+                        print(
+                            f"[SHADOW][DISCOVERY] /markets rate_limited series={series or 'ALL'} "
+                            f"page={pages + 1} attempt={attempts}/4 retry_in_s={wait_s:.1f}"
+                        )
+                        time.sleep(wait_s)
+                        continue
+                    cooldown_s = max(30.0, wait_s)
+                    print(
+                        f"[SHADOW][DISCOVERY] /markets rate_limited series={series or 'ALL'} "
+                        f"page={pages + 1} cooldown_s={cooldown_s:.1f}; pausing scan"
+                    )
+                    time.sleep(cooldown_s)
+                    break
+                if with_status_filter and status_code >= 400:
                     with_status_filter = False
                     print(
                         f"[SHADOW][DISCOVERY] /markets rejected status filter "
                         f"status={resp.status_code} series={series or 'ALL'}; retrying without status param"
                     )
                     continue
-                resp.raise_for_status()
-                payload = resp.json() if resp.content else {}
-            except Exception as exc:
-                print(
-                    f"[SHADOW][DISCOVERY] /markets sports fetch failed "
-                    f"series={series or 'ALL'} page={pages + 1} error={exc}"
-                )
+                try:
+                    resp.raise_for_status()
+                    payload = resp.json() if resp.content else {}
+                    request_ok = True
+                except Exception as exc:
+                    print(
+                        f"[SHADOW][DISCOVERY] /markets sports fetch failed "
+                        f"series={series or 'ALL'} page={pages + 1} error={exc}"
+                    )
+                break
+            if not request_ok:
                 break
             if not isinstance(payload, dict):
                 print(
@@ -726,6 +774,12 @@ def _discover_open_sports_market_tickers_from_markets_endpoint(
             cursor = next_cursor
 
     _scan_pass(series_ticker="KXNBAGAME", pages_limit=max_pages)
+    if float(series_stagger_seconds) > 0.0:
+        print(
+            f"[SHADOW][DISCOVERY] stagger init between series sleep_s="
+            f"{float(series_stagger_seconds):.2f}"
+        )
+        time.sleep(float(series_stagger_seconds))
     _scan_pass(series_ticker="KXNHLGAME", pages_limit=max_pages)
     if not out:
         _scan_pass(series_ticker="", pages_limit=min(max_pages, 5))
@@ -747,6 +801,10 @@ def _bootstrap_candidates_from_live_discovery(*, day: str, config: Dict[str, Any
         return []
 
     base_url = str(config.get("base_url") or DEFAULT_BASE).strip().rstrip("/") or DEFAULT_BASE
+    discovery_stagger_s = max(
+        0.0,
+        float(config.get("shadow_discovery_stagger_seconds", _DISCOVERY_STAGGER_SECONDS_DEFAULT)),
+    )
     out: List[Dict[str, str]] = []
     print(f"[SHADOW][DISCOVERY] bootstrap start day={day} date_token={date_token}")
     with requests.Session() as s:
@@ -792,6 +850,9 @@ def _bootstrap_candidates_from_live_discovery(*, day: str, config: Dict[str, Any
         print(f"[SHADOW][DISCOVERY] crypto spot={spot} candidates={crypto_count}")
 
         # Weather discovery (direct API, no local queue dependency).
+        if discovery_stagger_s > 0.0:
+            print(f"[SHADOW][DISCOVERY] stagger init before weather sleep_s={discovery_stagger_s:.2f}")
+            time.sleep(discovery_stagger_s)
         print("[DEBUG] Attempting Weather Discovery...")
         weather_series = config.get("shadow_weather_series_tickers", ["KXHIGHNY", "KXLOWNY"])
         if not isinstance(weather_series, list):
@@ -834,6 +895,9 @@ def _bootstrap_candidates_from_live_discovery(*, day: str, config: Dict[str, Any
         print(f"[SHADOW][DISCOVERY] weather candidates={weather_count}")
 
         # Sports discovery (plugin startup + direct API fallback).
+        if discovery_stagger_s > 0.0:
+            print(f"[SHADOW][DISCOVERY] stagger init before sports sleep_s={discovery_stagger_s:.2f}")
+            time.sleep(discovery_stagger_s)
         print("[DEBUG] Attempting Sports Discovery...")
         sports_series = config.get("shadow_sports_series_tickers", ["KXNBAGAME", "KXNHLGAME"])
         if not isinstance(sports_series, list):
@@ -847,6 +911,7 @@ def _bootstrap_candidates_from_live_discovery(*, day: str, config: Dict[str, Any
             date_token=str(date_token).strip().upper(),
             max_pages=sports_markets_max_pages,
             page_limit=sports_markets_page_limit,
+            series_stagger_seconds=discovery_stagger_s,
         )
         try:
             core_sports_tickers = discover_sports_tickers_for_date(
@@ -1290,6 +1355,7 @@ def _filter_candidates_with_dynamic_crypto_discovery(
 
 
 def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], config: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
+    global _LAST_EVENTS_PREVIEW_TS_MONO
     research_dir = ROOT / "reports" / "research" / day
     daily_csv = ROOT / "reports" / "daily" / f"{day}_candidates.csv"
 
@@ -1500,7 +1566,20 @@ def _discover_shadow_candidates(*, day: str, tickers_override: Sequence[str], co
     if not tickers_override:
         live_rows = _bootstrap_candidates_from_live_discovery(day=day, config=cfg)
         if not live_rows:
-            _debug_preview_event_tickers_from_api(day=day, config=cfg)
+            preview_cooldown_s = max(
+                30.0,
+                float(cfg.get("shadow_events_preview_cooldown_seconds", 300.0)),
+            )
+            now_mono = time.monotonic()
+            since_last_preview = now_mono - float(_LAST_EVENTS_PREVIEW_TS_MONO)
+            if since_last_preview >= preview_cooldown_s:
+                _LAST_EVENTS_PREVIEW_TS_MONO = now_mono
+                _debug_preview_event_tickers_from_api(day=day, config=cfg)
+            else:
+                print(
+                    f"[DEBUG] /events preview skipped cooldown_s={preview_cooldown_s:.1f} "
+                    f"remaining_s={max(0.0, preview_cooldown_s - since_last_preview):.1f}"
+                )
         if live_rows:
             merged: Dict[str, Dict[str, str]] = {
                 str(r.get("ticker") or "").strip().upper(): r
@@ -3480,6 +3559,10 @@ def main() -> int:
     maker_fee_rate = _shadow_fee_rate(cfg, execution_mode="maker")
     taker_fee_rate = _shadow_fee_rate(cfg, execution_mode="taker")
     seen_cap = int(cfg.get("shadow_seen_trade_ids_max", 2000))
+    empty_discovery_cooldown_s = max(
+        30.0,
+        float(cfg.get("shadow_empty_discovery_cooldown_seconds", _EMPTY_DISCOVERY_COOLDOWN_SECONDS_DEFAULT)),
+    )
 
     default_state_path = ROOT / "data" / "shadow" / f"{day_key}_state.json"
     default_ledger_path = ROOT / "reports" / "shadow" / f"{day_key}_shadow_ledger.csv"
@@ -3512,6 +3595,11 @@ def main() -> int:
         return 0
 
     candidates = _discover_shadow_candidates(day=day, tickers_override=tickers_override, config=cfg)
+    if not candidates and not tickers_override:
+        print(
+            f"[SHADOW][DISCOVERY] startup produced 0 candidates; "
+            f"applying cooldown_s={empty_discovery_cooldown_s:.1f} before rediscovery"
+        )
 
     state = _read_json(state_path)
 
@@ -3559,7 +3647,7 @@ def main() -> int:
     start_monotonic = time.monotonic()
     cycle = 0
     last_empty_discovery_attempt = 0.0
-    current_sleep_seconds = float(_SENTINEL_POLL_SECONDS)
+    current_sleep_seconds = max(float(_SENTINEL_POLL_SECONDS), float(empty_discovery_cooldown_s))
     last_poll_mode = ""
     crypto_series = str(cfg.get("shadow_crypto_series_ticker", "KXBTC")).strip().upper() or "KXBTC"
     btc_priority_prefix = f"{crypto_series}-"
@@ -3580,7 +3668,7 @@ def main() -> int:
 
         if not orders and not tickers_override:
             now_mono = time.monotonic()
-            rediscovery_every_s = max(10.0, float(current_sleep_seconds))
+            rediscovery_every_s = max(30.0, float(empty_discovery_cooldown_s), float(current_sleep_seconds))
             if (now_mono - last_empty_discovery_attempt) >= rediscovery_every_s:
                 last_empty_discovery_attempt = now_mono
                 print("[SHADOW][DISCOVERY] state has zero orders; retrying dynamic discovery")
@@ -3935,6 +4023,8 @@ def main() -> int:
             if orders or tickers_override:
                 break
             print("[SHADOW][HEARTBEAT] no active orders yet; continuing discovery loop")
+        if not orders and not tickers_override:
+            current_sleep_seconds = max(float(current_sleep_seconds), float(empty_discovery_cooldown_s))
         if max_runtime_minutes > 0 and (time.monotonic() - start_monotonic) >= (max_runtime_minutes * 60.0):
             break
         time.sleep(current_sleep_seconds)
