@@ -3408,11 +3408,17 @@ def _adaptive_poll_seconds(
     market_cache: Dict[str, Dict[str, Any]],
     config: Dict[str, Any],
     sniper_poll_seconds: float,
+    needed_market_tickers: Optional[Collection[str]] = None,
 ) -> Tuple[float, str]:
     now_utc = _utc_now()
     mode = "sentinel"
     poll_s = float(_SENTINEL_POLL_SECONDS)
     saw_active_sports = False
+    needed_tickers = {
+        str(t).strip().upper()
+        for t in (needed_market_tickers or ())
+        if str(t).strip()
+    }
 
     for order in orders:
         status = str(order.get("status") or "").strip().lower()
@@ -3432,8 +3438,15 @@ def _adaptive_poll_seconds(
         close_ts = _parse_ts(order.get("close_time"))
         if close_ts is not None:
             secs_to_close = float((close_ts - now_utc).total_seconds())
+            if status == "filled" and ticker not in needed_tickers:
+                continue
             if 0.0 <= secs_to_close <= _SNIPER_WINDOW_SECONDS:
                 return (max(0.1, float(sniper_poll_seconds)), "sniper:final_market_window")
+        if status == "filled":
+            # Filled orders only need hot polling when they are actively watched
+            # for settlement / resolution. Do not keep the bot in sniper mode
+            # solely because the game is live.
+            continue
 
         commence_ts = _lookup_sports_commence_time_utc(order=order, config=config)
         if commence_ts is None:
@@ -3448,6 +3461,51 @@ def _adaptive_poll_seconds(
     if mode == "pregame" and saw_active_sports:
         return (max(0.1, float(poll_s)), "pregame")
     return (max(0.1, float(_SENTINEL_POLL_SECONDS)), "sentinel")
+
+
+def _filled_order_needs_market_watch(
+    *,
+    order: Dict[str, Any],
+    resolution_cutoff: dt.datetime,
+) -> bool:
+    close_ts = _parse_ts(order.get("close_time"))
+    if close_ts is None:
+        # Missing close_time is unsafe: keep one market fetch path active so we can
+        # backfill settlement timing and resolve the order cleanly.
+        return True
+    return bool(close_ts <= resolution_cutoff)
+
+
+def _backfill_filled_order_close_times(
+    *,
+    orders: Sequence[Dict[str, Any]],
+    market_cache: Mapping[str, Dict[str, Any]],
+    session: Optional[requests.Session] = None,
+    base_url: str = DEFAULT_BASE,
+) -> None:
+    for order in orders:
+        if str(order.get("status") or "").strip().lower() != "filled":
+            continue
+        if str(order.get("close_time") or "").strip():
+            continue
+        runtime_ticker = str(order.get("_runtime_market_ticker") or order.get("ticker") or "").strip().upper()
+        if not runtime_ticker:
+            continue
+        market = market_cache.get(runtime_ticker)
+        if (not isinstance(market, dict) or not str(market.get("close_time") or market.get("expiration_time") or "").strip()) and session is not None:
+            try:
+                market = _fetch_market(session=session, base_url=base_url, ticker=runtime_ticker)
+            except Exception:
+                market = market if isinstance(market, dict) else None
+            if isinstance(market, dict):
+                print(f"[SHADOW][DISCOVERY] metadata REST backfill ticker={runtime_ticker}")
+        if not isinstance(market, dict):
+            continue
+        close_time = str(market.get("close_time") or market.get("expiration_time") or "").strip()
+        if not close_time:
+            continue
+        order["close_time"] = close_time
+        print(f"[SHADOW][DISCOVERY] backfilled filled order close_time ticker={runtime_ticker} close_time={close_time}")
 
 
 def _all_done(orders: Sequence[Dict[str, Any]]) -> bool:
@@ -3961,8 +4019,7 @@ def main() -> int:
                 if _is_sports_order(o):
                     open_sports_tickers.add(runtime_ticker)
             elif status == "filled":
-                close_ts = _parse_ts(o.get("close_time"))
-                if close_ts is not None and close_ts <= resolution_cutoff:
+                if _filled_order_needs_market_watch(order=o, resolution_cutoff=resolution_cutoff):
                     needed_market_tickers.add(runtime_ticker)
         print(
             f"[SHADOW][HEARTBEAT] needed_market_tickers={len(needed_market_tickers)} "
@@ -4170,6 +4227,12 @@ def main() -> int:
                     except Exception as exc:
                         print(f"[SHADOW][WS] override REST fallback failed ticker={ticker} error={exc}")
 
+            _backfill_filled_order_close_times(
+                orders=orders,
+                market_cache=market_cache,
+                session=s,
+                base_url=base_url,
+            )
         econ_state = _econ_pmf_state(config=cfg, econ_cache_dir=econ_cache_dir)
 
         # Reprice / edge-gate still-open orders.
@@ -4255,6 +4318,7 @@ def main() -> int:
             market_cache=market_cache,
             config=cfg,
             sniper_poll_seconds=sniper_poll_seconds,
+            needed_market_tickers=needed_market_tickers,
         )
         if poll_mode != last_poll_mode:
             print(
