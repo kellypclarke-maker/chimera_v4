@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Dict, Mapping, Optional, Sequence, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import websockets
 
@@ -187,11 +188,28 @@ def _listener_enabled(config: Mapping[str, object]) -> bool:
 
 
 def _ws_url(config: Mapping[str, object]) -> str:
-    return _env_or_cfg(config, "BOLTODDS_WS_URL", "wss://ws.boltodds.com")
+    return _env_or_cfg(config, "BOLTODDS_WS_URL", "wss://spro.agency/api")
 
 
 def _api_key(config: Mapping[str, object]) -> str:
     return _env_or_cfg(config, "BOLTODDS_API_KEY", "")
+
+
+def _ws_url_with_key(*, ws_url: str, api_key: str) -> str:
+    raw = str(ws_url or "").strip()
+    key = str(api_key or "").strip()
+    if not raw:
+        return ""
+    if not key:
+        return raw
+    if "{key}" in raw:
+        return raw.replace("{key}", key)
+    parsed = urlparse(raw)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if "key" not in query:
+        query["key"] = key
+    new_query = urlencode(query, doseq=True)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
 
 
 def _float_cfg(config: Mapping[str, object], key: str, default: float) -> float:
@@ -199,6 +217,58 @@ def _float_cfg(config: Mapping[str, object], key: str, default: float) -> float:
         return float(config.get(key, default))
     except Exception:
         return float(default)
+
+
+def _subscription_payload(config: Mapping[str, object]) -> Dict[str, object]:
+    sub_payload = config.get("boltodds_subscribe_payload")
+    if isinstance(sub_payload, str):
+        try:
+            sub_payload = json.loads(sub_payload)
+        except Exception:
+            sub_payload = None
+    if isinstance(sub_payload, Mapping):
+        action = str(sub_payload.get("action") or "subscribe").strip() or "subscribe"
+        filters_obj = sub_payload.get("filters")
+        if isinstance(filters_obj, Mapping):
+            sports = list(filters_obj.get("sports") or ["NBA", "NHL"])
+            markets = list(filters_obj.get("markets") or ["Moneyline"])
+        else:
+            sports = list(sub_payload.get("sports") or ["NBA", "NHL"])
+            markets = list(sub_payload.get("markets") or ["Moneyline"])
+        return {
+            "action": action,
+            "filters": {
+                "sports": [str(x) for x in sports if str(x).strip()],
+                "markets": [str(x) for x in markets if str(x).strip()],
+            },
+        }
+    return {
+        "action": "subscribe",
+        "filters": {
+            "sports": ["NBA", "NHL"],
+            "markets": ["Moneyline"],
+        },
+    }
+
+
+def _iter_payload_objects(raw_msg: object) -> Sequence[Mapping[str, object]]:
+    out = []
+    if isinstance(raw_msg, Mapping):
+        if isinstance(raw_msg.get("payload"), Mapping):
+            out.append(raw_msg.get("payload"))
+        out.append(raw_msg)
+    elif isinstance(raw_msg, Sequence) and not isinstance(raw_msg, (str, bytes, bytearray)):
+        out.extend([x for x in raw_msg if isinstance(x, Mapping)])
+    return [x for x in out if isinstance(x, Mapping)]
+
+
+def _extract_error_message(raw_msg: object) -> Optional[str]:
+    for payload in _iter_payload_objects(raw_msg):
+        action = str(payload.get("action") or payload.get("type") or "").strip().lower()
+        if action == "error":
+            msg = str(payload.get("message") or payload.get("error") or "unknown BoltOdds policy error").strip()
+            return msg or "unknown BoltOdds policy error"
+    return None
 
 
 def _extract_decimal_odds(team_payload: Mapping[str, object]) -> Optional[float]:
@@ -368,24 +438,10 @@ async def _listener_loop(config: Mapping[str, object], stop_event: threading.Eve
             _STORE.set_state(ListenerState.SUSPENDED, generation_id=generation)
             await asyncio.sleep(5.0)
             continue
+        ws_connect_url = _ws_url_with_key(ws_url=ws_url, api_key=api_key)
 
         _STORE.set_state(ListenerState.CONNECTING, generation_id=generation)
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "X-API-KEY": api_key,
-        }
-        sub_payload = config.get("boltodds_subscribe_payload")
-        if isinstance(sub_payload, str):
-            try:
-                sub_payload = json.loads(sub_payload)
-            except Exception:
-                sub_payload = None
-        if not isinstance(sub_payload, Mapping):
-            sub_payload = {
-                "action": "subscribe",
-                "sports": ["NBA", "NHL"],
-                "markets": ["Moneyline"],
-            }
+        sub_payload = _subscription_payload(config)
 
         try:
             _STORE.set_state(ListenerState.SUBSCRIBING, generation_id=generation)
@@ -393,15 +449,33 @@ async def _listener_loop(config: Mapping[str, object], stop_event: threading.Eve
                 "ping_interval": 20,
                 "close_timeout": 5,
                 "open_timeout": 10,
-                "extra_headers": headers,
             }
-            try:
-                ws = await websockets.connect(ws_url, additional_headers=headers, ping_interval=20, close_timeout=5, open_timeout=10)
-            except TypeError:
-                ws = await websockets.connect(ws_url, **connect_kwargs)
+            ws = await websockets.connect(ws_connect_url, **connect_kwargs)
 
             async with ws:
+                # BoltOdds emits an immediate payload after connect; wait for it before subscribe.
+                ack_raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                if isinstance(ack_raw, (bytes, bytearray)):
+                    ack_raw = ack_raw.decode("utf-8", errors="ignore")
+                try:
+                    ack_msg = json.loads(str(ack_raw))
+                except Exception:
+                    ack_msg = {"raw": str(ack_raw)}
+                err = _extract_error_message(ack_msg)
+                if err:
+                    print(
+                        f"[SHADOW][ORACLE][CRITICAL] BoltOdds policy/auth error during connect handshake: {err}"
+                    )
+                    _STORE.set_state(ListenerState.SUSPENDED, generation_id=generation)
+                    stop_event.set()
+                    return
+                print(
+                    f"[SHADOW][ORACLE] BoltOdds ack received generation={generation} "
+                    f"payload_type={type(ack_msg).__name__}"
+                )
+
                 await ws.send(json.dumps(sub_payload, separators=(",", ":"), sort_keys=True))
+                print(f"[SHADOW][ORACLE] BoltOdds subscribe sent payload={sub_payload}")
                 _STORE.set_state(ListenerState.SYNCING, generation_id=generation)
                 seq_no = 0
                 backoff = 1.0
@@ -415,14 +489,18 @@ async def _listener_loop(config: Mapping[str, object], stop_event: threading.Eve
                     except Exception:
                         continue
 
+                    err = _extract_error_message(msg)
+                    if err:
+                        print(
+                            f"[SHADOW][ORACLE][CRITICAL] BoltOdds stream error received: {err}. "
+                            f"Listener entering SUSPENDED and stopping."
+                        )
+                        _STORE.set_state(ListenerState.SUSPENDED, generation_id=generation)
+                        stop_event.set()
+                        return
+
                     payloads = []
-                    if isinstance(msg, Mapping):
-                        # Handle both envelope + direct payload styles.
-                        if isinstance(msg.get("payload"), Mapping):
-                            payloads.append(msg.get("payload"))
-                        payloads.append(msg)
-                    elif isinstance(msg, Sequence):
-                        payloads.extend([x for x in msg if isinstance(x, Mapping)])
+                    payloads.extend(_iter_payload_objects(msg))
 
                     accepted = 0
                     for payload in payloads:
@@ -450,7 +528,8 @@ async def _listener_loop(config: Mapping[str, object], stop_event: threading.Eve
 
         except asyncio.CancelledError:
             break
-        except Exception:
+        except Exception as exc:
+            print(f"[SHADOW][ORACLE] BoltOdds listener reconnecting error={type(exc).__name__}: {exc}")
             _STORE.set_state(ListenerState.RECONNECTING, generation_id=generation)
             jitter = random.random() * 0.2 * backoff
             await asyncio.sleep(min(30.0, backoff + jitter))
