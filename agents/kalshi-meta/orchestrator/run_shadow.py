@@ -3877,6 +3877,12 @@ def main() -> int:
                         f"disabling private auth path={private_key_path}"
                     )
                 use_private_auth = _as_bool(cfg.get("sports_ws_use_private_auth"), default=False)
+                if use_private_auth and not (key_id_present and private_key_present):
+                    use_private_auth = False
+                    print(
+                        "[SHADOW][WS] config requested private auth but credentials are incomplete; "
+                        "disabling private auth for this cycle"
+                    )
                 if not use_private_auth and key_id_present and private_key_present:
                     use_private_auth = True
                     print("[SHADOW][WS] promoting private auth from env credentials")
