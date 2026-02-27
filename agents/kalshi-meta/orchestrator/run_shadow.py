@@ -18,11 +18,13 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = ROOT.parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 print(f"[DEBUG] Python Path: {sys.path[0]}")
 
-from kalshi_core.clients.fees import maker_fee_dollars, taker_fee_dollars
+from chimera.fees import FeeConfig, execution_fee_dollars, expected_value_yes
 from kalshi_core.clients.kalshi_public import (
     discover_viable_crypto_tickers_for_date,
     discover_sports_tickers_for_date,
@@ -136,6 +138,10 @@ ROOT_SHADOW_LEDGER_HEADERS: Tuple[str, ...] = (
     "quantity",
     "spot_price",
     "expected_value",
+    "Gross_EV",
+    "Net_EV",
+    "Fee_Paid",
+    "Execution_Mode",
 )
 _ROOT_HF_LEDGER_ENABLED: bool = True
 _ROOT_HF_LEDGER_PATH: Path = REPO_ROOT / "shadow_ledger.csv"
@@ -149,6 +155,10 @@ def log_shadow_trade(
     quantity: int,
     spot_price: Optional[float],
     expected_value: Optional[float],
+    gross_ev: Optional[float] = None,
+    net_ev: Optional[float] = None,
+    fee_paid: Optional[float] = None,
+    execution_mode: str = "",
 ) -> None:
     if not bool(_ROOT_HF_LEDGER_ENABLED):
         return
@@ -168,6 +178,10 @@ def log_shadow_trade(
                 int(quantity),
                 "" if spot_price is None else float(spot_price),
                 "" if expected_value is None else float(expected_value),
+                "" if gross_ev is None else float(gross_ev),
+                "" if net_ev is None else float(net_ev),
+                "" if fee_paid is None else float(fee_paid),
+                str(execution_mode or "").strip().lower(),
             ]
         )
 
@@ -267,6 +281,21 @@ def _log_hf_eval_sample(
         if isinstance(eval_out, dict)
         else None
     )
+    gross_ev = (
+        _parse_float(eval_out.get("gross_ev_dollars"))
+        if isinstance(eval_out, dict)
+        else None
+    )
+    fee_paid = (
+        _parse_float(eval_out.get("fees_dollars"))
+        if isinstance(eval_out, dict)
+        else None
+    )
+    execution_mode = (
+        str(eval_out.get("execution_mode") or "")
+        if isinstance(eval_out, dict)
+        else str(order.get("maker_or_taker") or "")
+    )
     log_shadow_trade(
         oracle_type=_infer_oracle_type(
             ticker=ticker or order_ticker,
@@ -278,6 +307,10 @@ def _log_hf_eval_sample(
         quantity=int(quantity),
         spot_price=(None if p_true is None else float(p_true)),
         expected_value=(None if ev is None else float(ev)),
+        gross_ev=(None if gross_ev is None else float(gross_ev)),
+        net_ev=(None if ev is None else float(ev)),
+        fee_paid=(None if fee_paid is None else float(fee_paid)),
+        execution_mode=execution_mode,
     )
 
 
@@ -1225,9 +1258,9 @@ def _normalize_ev_thresholds_for_shadow_test(config: Dict[str, Any]) -> None:
 
 
 def _shadow_execution_mode(config: Dict[str, Any]) -> str:
-    mode = str(config.get("shadow_execution_mode", "maker")).strip().lower()
+    mode = str(config.get("shadow_execution_mode", "taker")).strip().lower()
     if mode not in {"maker", "taker"}:
-        return "maker"
+        return "taker"
     return mode
 
 
@@ -1241,6 +1274,56 @@ def _shadow_fee_rate(config: Dict[str, Any], *, execution_mode: str) -> float:
     if "shadow_maker_fee_rate" in config:
         return float(config.get("shadow_maker_fee_rate", 0.0))
     return float(config.get("maker_fee_rate", 0.0))
+
+
+def _shadow_fee_flat(config: Dict[str, Any], *, execution_mode: str) -> float:
+    if str(execution_mode).strip().lower() == "taker":
+        if "shadow_taker_fee_flat" in config:
+            return float(config.get("shadow_taker_fee_flat", 0.0))
+        return float(config.get("taker_fee_flat", 0.0))
+    if "shadow_maker_fee_flat" in config:
+        return float(config.get("shadow_maker_fee_flat", 0.0))
+    return float(config.get("maker_fee_flat", 0.0))
+
+
+def _shadow_fee_config(config: Dict[str, Any]) -> FeeConfig:
+    existing = config.get("_fee_config")
+    if isinstance(existing, FeeConfig):
+        return existing
+    env_cfg = FeeConfig.from_env()
+    maker_fee_flat = float(env_cfg.maker_fee_flat)
+    taker_fee_flat = float(env_cfg.taker_fee_flat)
+    maker_fee_rate = float(env_cfg.maker_fee_rate)
+    taker_fee_rate = float(env_cfg.taker_fee_rate)
+
+    if "shadow_maker_fee_flat" in config:
+        maker_fee_flat = float(config.get("shadow_maker_fee_flat", maker_fee_flat))
+    elif "maker_fee_flat" in config:
+        maker_fee_flat = float(config.get("maker_fee_flat", maker_fee_flat))
+
+    if "shadow_taker_fee_flat" in config:
+        taker_fee_flat = float(config.get("shadow_taker_fee_flat", taker_fee_flat))
+    elif "taker_fee_flat" in config:
+        taker_fee_flat = float(config.get("taker_fee_flat", taker_fee_flat))
+
+    if "shadow_maker_fee_rate" in config:
+        maker_fee_rate = float(config.get("shadow_maker_fee_rate", maker_fee_rate))
+    elif "maker_fee_rate" in config:
+        maker_fee_rate = float(config.get("maker_fee_rate", maker_fee_rate))
+
+    if "shadow_taker_fee_rate" in config:
+        taker_fee_rate = float(config.get("shadow_taker_fee_rate", taker_fee_rate))
+    elif "taker_fee_rate" in config:
+        taker_fee_rate = float(config.get("taker_fee_rate", taker_fee_rate))
+
+    merged = FeeConfig(
+        maker_fee_flat=maker_fee_flat,
+        taker_fee_flat=taker_fee_flat,
+        maker_fee_rate=maker_fee_rate,
+        taker_fee_rate=taker_fee_rate,
+    )
+    config["_fee_config"] = merged
+    return merged
 
 
 def _parse_ticker_override(raw: str) -> List[str]:
@@ -1802,6 +1885,9 @@ def _migrate_order(order: Dict[str, Any], day: str) -> Dict[str, Any]:
     out.setdefault("size_contracts", out.get("size_contracts") or "1")
     out.setdefault("fees_assumed_dollars", out.get("fees_assumed_dollars") or out.get("fees_dollars") or "0.0")
     out.setdefault("slippage_assumed_dollars", out.get("slippage_assumed_dollars") or "0.0")
+    out.setdefault("gross_ev_dollars", str(out.get("gross_ev_dollars") or out.get("Gross_EV") or out.get("ev_dollars") or ""))
+    out.setdefault("net_ev_dollars", str(out.get("net_ev_dollars") or out.get("Net_EV") or out.get("ev_dollars") or ""))
+    out.setdefault("fee_paid_dollars", str(out.get("fee_paid_dollars") or out.get("Fee_Paid") or out.get("fees_assumed_dollars") or "0.0"))
     out.setdefault("rules_text_hash", str(out.get("rules_text_hash") or ""))
     out.setdefault("rules_pointer", str(out.get("rules_pointer") or ""))
     out.setdefault("resolution_pointer", str(out.get("resolution_pointer") or ""))
@@ -1876,6 +1962,9 @@ def _build_order_from_candidate(*, row: Dict[str, str], day: str, size_contracts
         "size_contracts": str(max(1, int(size_contracts))),
         "fees_assumed_dollars": str(row.get("fees_assumed_dollars") or "0.0"),
         "slippage_assumed_dollars": str(row.get("slippage_assumed_dollars") or "0.0"),
+        "gross_ev_dollars": ("" if initial_ev is None else f"{float(initial_ev):.6f}"),
+        "net_ev_dollars": ("" if initial_ev is None else f"{float(initial_ev):.6f}"),
+        "fee_paid_dollars": str(row.get("fees_assumed_dollars") or "0.0"),
         "rules_text_hash": str(row.get("rules_text_hash") or ""),
         "rules_pointer": str(row.get("rules_pointer") or ""),
         "resolution_pointer": str(row.get("resolution_pointer") or ""),
@@ -1971,6 +2060,10 @@ def _initialize_or_update_state(
                     quantity=int(qty),
                     spot_price=_spot_from_candidate_row(row),
                     expected_value=_parse_float(row.get("ev_dollars")),
+                    gross_ev=_parse_float(row.get("ev_dollars")),
+                    net_ev=_parse_float(row.get("ev_dollars")),
+                    fee_paid=_parse_float(row.get("fees_assumed_dollars")),
+                    execution_mode=str(order.get("maker_or_taker") or ""),
                 )
 
     for t in sorted(existing_by_ticker.keys()):
@@ -2109,6 +2202,10 @@ def _project_canonical_rows(orders: Iterable[Dict[str, Any]]) -> List[Dict[str, 
             event_ticker=str(o.get("event_ticker") or ""),
             category=str(o.get("category") or ""),
         )
+        row["Gross_EV"] = str(o.get("gross_ev_dollars") or o.get("Gross_EV") or "")
+        row["Net_EV"] = str(o.get("net_ev_dollars") or o.get("Net_EV") or o.get("_runtime_last_ev") or "")
+        row["Fee_Paid"] = str(o.get("fee_paid_dollars") or o.get("Fee_Paid") or o.get("fees_assumed_dollars") or "")
+        row["Execution_Mode"] = str(o.get("maker_or_taker") or o.get("Execution_Mode") or "")
         out.append(row)
     return out
 
@@ -2268,6 +2365,10 @@ def _apply_cancel_replace(
             quantity=int(qty),
             spot_price=(None if mu is None else float(mu)),
             expected_value=(None if ev_dollars is None else float(ev_dollars)),
+            gross_ev=_parse_float(order.get("gross_ev_dollars")),
+            net_ev=(None if ev_dollars is None else float(ev_dollars)),
+            fee_paid=_parse_float(order.get("fee_paid_dollars")),
+            execution_mode=str(order.get("maker_or_taker") or ""),
         )
     return True
 
@@ -2363,6 +2464,8 @@ def _evaluate_yes_pricing(
         return {"ok": False, "reason": "liquidity_guard_failed"}
 
     mode = _shadow_execution_mode(config)
+    fee_config = _shadow_fee_config(config)
+    is_maker = mode == "maker"
     slippage_dollars = float(config.get(slippage_cents_key, 0.25)) / 100.0
     if mode == "taker":
         if yes_ask is None:
@@ -2372,11 +2475,24 @@ def _evaluate_yes_pricing(
             return {"ok": False, "reason": "ask_out_of_range"}
         p_fill = 1.0
         price = float(intended) / 100.0
-        fee_rate = _shadow_fee_rate(config, execution_mode=mode)
-        fees = taker_fee_dollars(contracts=1, price=price, rate=fee_rate)
-        ev_raw = float(p_true) - price - float(fees) - slippage_dollars
+        gross_single = expected_value_yes(
+            p_true=float(p_true),
+            price=price,
+            fee=0.0,
+            is_maker=False,
+            contracts=1,
+            fee_config=fee_config,
+        )
+        fees = execution_fee_dollars(
+            contracts=1,
+            price=price,
+            is_maker=False,
+            fee_config=fee_config,
+        )
+        gross_ev = float(gross_single)
         taker_fee_floor = float(config.get("shadow_taker_conservative_fee_dollars", 0.0175))
-        ev = float(ev_raw) - float(taker_fee_floor)
+        fee_paid = float(fees) + float(taker_fee_floor)
+        ev = float(gross_ev) - float(fee_paid) - slippage_dollars
         min_net_ev = float(config.get("shadow_taker_min_net_ev_dollars", 0.01))
         if ev <= min_net_ev:
             return {
@@ -2412,18 +2528,35 @@ def _evaluate_yes_pricing(
             return {"ok": False, "reason": "fill_prob_zero"}
 
         price = float(intended) / 100.0
-        fee_rate = _shadow_fee_rate(config, execution_mode=mode)
-        fees = maker_fee_dollars(contracts=1, price=price, rate=fee_rate)
-        ev = float(p_fill) * (float(p_true) - price - float(fees) - slippage_dollars)
+        gross_single = expected_value_yes(
+            p_true=float(p_true),
+            price=price,
+            fee=0.0,
+            is_maker=True,
+            contracts=1,
+            fee_config=fee_config,
+        )
+        fees = execution_fee_dollars(
+            contracts=1,
+            price=price,
+            is_maker=True,
+            fee_config=fee_config,
+        )
+        gross_ev = float(p_fill) * float(gross_single)
+        fee_paid = float(p_fill) * float(fees)
+        ev = float(gross_ev) - float(fee_paid) - (float(p_fill) * slippage_dollars)
 
     return {
         "ok": True,
         "execution_mode": mode,
         "intended_price_cents": int(intended),
         "p_fill": float(p_fill),
-        "fees_dollars": float(fees),
+        "fees_dollars": float(fee_paid),
         "slippage_dollars": float(slippage_dollars),
+        "gross_ev_dollars": float(gross_ev),
+        "net_ev_dollars": float(ev),
         "ev_dollars": float(ev),
+        "is_maker": bool(is_maker),
     }
 
 
@@ -2537,6 +2670,8 @@ def _evaluate_sports_edge(
         "sigma": 0.0,
         "fees_dollars": float(pricing.get("fees_dollars") or 0.0),
         "slippage_dollars": float(pricing.get("slippage_dollars") or 0.0),
+        "gross_ev_dollars": float(pricing.get("gross_ev_dollars") or 0.0),
+        "net_ev_dollars": float(pricing.get("net_ev_dollars") or 0.0),
         "ev_dollars": float(ev),
         "forecast_updated": _utc_now_iso(),
         "station_id": "",
@@ -2693,6 +2828,8 @@ def _evaluate_weather_edge(
         "sigma": float(sigma),
         "fees_dollars": float(pricing.get("fees_dollars") or 0.0),
         "slippage_dollars": float(pricing.get("slippage_dollars") or 0.0),
+        "gross_ev_dollars": float(pricing.get("gross_ev_dollars") or 0.0),
+        "net_ev_dollars": float(pricing.get("net_ev_dollars") or 0.0),
         "ev_dollars": float(pricing.get("ev_dollars") or 0.0),
         "forecast_updated": forecast_updated,
         "station_id": station_id,
@@ -2779,6 +2916,8 @@ def _evaluate_econ_edge(
         "sigma": float("nan"),
         "fees_dollars": float(pricing.get("fees_dollars") or 0.0),
         "slippage_dollars": float(pricing.get("slippage_dollars") or 0.0),
+        "gross_ev_dollars": float(pricing.get("gross_ev_dollars") or 0.0),
+        "net_ev_dollars": float(pricing.get("net_ev_dollars") or 0.0),
         "ev_dollars": float(pricing.get("ev_dollars") or 0.0),
         "forecast_updated": "",
         "station_id": "",
@@ -2917,6 +3056,8 @@ def _evaluate_crypto_edge(
         "sigma": float(sigma_per_sqrt_s),
         "fees_dollars": float(pricing.get("fees_dollars") or 0.0),
         "slippage_dollars": float(pricing.get("slippage_dollars") or 0.0),
+        "gross_ev_dollars": float(pricing.get("gross_ev_dollars") or 0.0),
+        "net_ev_dollars": float(pricing.get("net_ev_dollars") or 0.0),
         "ev_dollars": float(pricing.get("ev_dollars") or 0.0),
         "forecast_updated": as_of.isoformat(),
         "station_id": "",
@@ -2986,7 +3127,9 @@ def _update_open_order_lifecycle(
         print(
             f"[SHADOW][EVAL] {mode_tag} ticker={ticker} model={str(eval_out.get('model') or '')} "
             f"p_true={float(eval_out.get('p_true') or 0.0):.6f} "
-            f"ev={float(eval_out.get('ev_dollars') or 0.0):.6f} "
+            f"gross_ev={float(eval_out.get('gross_ev_dollars') or 0.0):.6f} "
+            f"net_ev={float(eval_out.get('ev_dollars') or 0.0):.6f} "
+            f"fee={float(eval_out.get('fees_dollars') or 0.0):.6f} "
             f"intended={int(float(str(eval_out.get('intended_price_cents') or '0') or '0'))}"
         )
     else:
@@ -3034,11 +3177,16 @@ def _update_open_order_lifecycle(
     if exec_mode not in {"maker", "taker"}:
         exec_mode = "maker"
     ev = float(eval_out.get("ev_dollars") or 0.0)
+    gross_ev = float(eval_out.get("gross_ev_dollars") or ev)
+    fee_paid = float(eval_out.get("fees_dollars") or 0.0)
     order["maker_or_taker"] = exec_mode
     order["action"] = ("buy_yes" if exec_mode == "taker" else "post_yes")
 
     order["fees_assumed_dollars"] = f"{float(eval_out.get('fees_dollars') or 0.0):.6f}"
     order["slippage_assumed_dollars"] = f"{float(eval_out.get('slippage_dollars') or 0.0):.6f}"
+    order["gross_ev_dollars"] = f"{gross_ev:.6f}"
+    order["net_ev_dollars"] = f"{ev:.6f}"
+    order["fee_paid_dollars"] = f"{fee_paid:.6f}"
     order["_runtime_last_ev"] = f"{ev:.6f}"
     new_p_true = float(eval_out.get("p_true") or 0.0)
     old_p_true = _parse_float(order.get("_runtime_last_p_true"))
@@ -3057,7 +3205,8 @@ def _update_open_order_lifecycle(
         str(order.get("notes") or ""),
         prefix="latest_eval=",
         value=(
-            f"ev={ev:.6f},mu={float(eval_out.get('mu') or 0.0):.4f},"
+            f"net_ev={ev:.6f},gross_ev={gross_ev:.6f},fee_paid={fee_paid:.6f},mode={exec_mode},"
+            f"mu={float(eval_out.get('mu') or 0.0):.4f},"
             f"sigma={float(eval_out.get('sigma') or 0.0):.4f},"
             f"p_true={float(eval_out.get('p_true') or 0.0):.6f},"
             f"forecast_updated={str(eval_out.get('forecast_updated') or '')},"
@@ -3126,6 +3275,10 @@ def _update_open_order_lifecycle(
                 quantity=int(qty),
                 spot_price=float(eval_out.get("mu") or 0.0),
                 expected_value=float(ev),
+                gross_ev=float(gross_ev),
+                net_ev=float(ev),
+                fee_paid=float(fee_paid),
+                execution_mode=exec_mode,
             )
         return
 
@@ -3207,8 +3360,7 @@ def _grade_resolutions(
     orders: List[Dict[str, Any]],
     market_cache: Dict[str, Dict[str, Any]],
     default_execution_mode: str,
-    maker_fee_rate: float,
-    taker_fee_rate: float,
+    fee_config: FeeConfig,
 ) -> None:
     now_iso = _utc_now_iso()
     for order in orders:
@@ -3237,10 +3389,12 @@ def _grade_resolutions(
         payout = 1.0 if result == "yes" else 0.0
         fill_price = float(fill_cents) / 100.0
         exec_mode = str(order.get("maker_or_taker") or default_execution_mode).strip().lower()
-        if exec_mode == "taker":
-            fees = taker_fee_dollars(contracts=size, price=fill_price, rate=taker_fee_rate)
-        else:
-            fees = maker_fee_dollars(contracts=size, price=fill_price, rate=maker_fee_rate)
+        fees = execution_fee_dollars(
+            contracts=size,
+            price=fill_price,
+            is_maker=(exec_mode != "taker"),
+            fee_config=fee_config,
+        )
         pnl = float(size) * (payout - fill_price) - float(fees)
         deployed = float(size) * fill_price + float(fees)
         roi = pnl / deployed if deployed > 0.0 else 0.0
@@ -3249,6 +3403,7 @@ def _grade_resolutions(
         order["resolved_ts"] = now_iso
         order["resolved_payout_dollars"] = f"{payout:.6f}"
         order["fees_assumed_dollars"] = f"{fees:.6f}"
+        order["fee_paid_dollars"] = f"{fees:.6f}"
         order["realized_pnl_dollars"] = f"{pnl:.6f}"
         order["_runtime_roi"] = f"{roi:.6f}"
         order["notes"] = _append_note(order.get("notes", ""), f"result={result}")
@@ -3540,8 +3695,6 @@ def _run_backtest_day(
     summary_path: Path,
 ) -> Tuple[Path, Path]:
     execution_mode = _shadow_execution_mode(cfg)
-    maker_fee_rate = _shadow_fee_rate(cfg, execution_mode="maker")
-    taker_fee_rate = _shadow_fee_rate(cfg, execution_mode="taker")
     size_contracts = max(1, int(cfg.get("base_size_contracts", 1)))
     candidates = _discover_shadow_candidates(day=day, tickers_override=tickers_override, config=cfg)
     orders = [
@@ -3637,8 +3790,7 @@ def _run_backtest_day(
             orders=orders,
             market_cache=market_cache,
             default_execution_mode=execution_mode,
-            maker_fee_rate=float(maker_fee_rate),
-            taker_fee_rate=float(taker_fee_rate),
+            fee_config=_shadow_fee_config(cfg),
         )
 
     state = {'orders': orders}
@@ -3695,6 +3847,7 @@ def main() -> int:
     parser.add_argument("--summary-path", default="", help="Optional summary markdown output path.")
     parser.add_argument("--shared-feed-path", default="", help="Optional shared Kalshi market feed JSON path.")
     parser.add_argument("--shared-feed-max-age-seconds", type=float, default=2.0, help="Max shared feed age before considered stale.")
+    parser.add_argument("--is-maker", action="store_true", help="Use maker-mode fee routing and execution assumptions (default: taker).")
     parser.add_argument("--disable-hf-root-ledger", action="store_true", help="Disable repo-root HF eval ledger appends.")
     parser.add_argument("--hf-root-ledger-path", default="", help="Optional override for root HF eval ledger CSV path.")
     parser.add_argument(
@@ -3716,7 +3869,9 @@ def main() -> int:
         _archive_and_reset_root_shadow_ledger()
 
     cfg = _load_config(Path(str(args.config)))
+    cfg["shadow_execution_mode"] = ("maker" if bool(args.is_maker) else "taker")
     _normalize_ev_thresholds_for_shadow_test(cfg)
+    fee_config = _shadow_fee_config(cfg)
     print(
         f"[SHADOW][CONFIG] sports_oracle_provider="
         f"{str(cfg.get('sports_oracle_provider', 'odds_api') or 'odds_api').strip().lower()}"
@@ -3735,8 +3890,13 @@ def main() -> int:
         print(f"[SHADOW][LEDGER] HF root ledger path={_ROOT_HF_LEDGER_PATH}")
     base_url = str(cfg.get("base_url") or DEFAULT_BASE).strip().rstrip("/") or DEFAULT_BASE
     execution_mode = _shadow_execution_mode(cfg)
-    maker_fee_rate = _shadow_fee_rate(cfg, execution_mode="maker")
-    taker_fee_rate = _shadow_fee_rate(cfg, execution_mode="taker")
+    print(
+        f"[SHADOW][CONFIG] execution_mode={execution_mode} "
+        f"maker_fee_flat={float(fee_config.maker_fee_flat):.6f} "
+        f"taker_fee_flat={float(fee_config.taker_fee_flat):.6f} "
+        f"maker_fee_rate={float(fee_config.maker_fee_rate):.6f} "
+        f"taker_fee_rate={float(fee_config.taker_fee_rate):.6f}"
+    )
     seen_cap = int(cfg.get("shadow_seen_trade_ids_max", 2000))
     empty_discovery_cooldown_s = max(
         30.0,
@@ -4234,8 +4394,7 @@ def main() -> int:
             orders=orders,
             market_cache=market_cache,
             default_execution_mode=execution_mode,
-            maker_fee_rate=maker_fee_rate,
-            taker_fee_rate=taker_fee_rate,
+            fee_config=_shadow_fee_config(cfg),
         )
 
         state["orders"] = orders
