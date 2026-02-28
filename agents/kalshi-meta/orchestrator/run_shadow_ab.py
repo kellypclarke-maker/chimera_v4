@@ -39,6 +39,13 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _start_process(cmd: List[str], *, log_path: Path, env: dict[str, str]) -> subprocess.Popen:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     fh = log_path.open("a", encoding="utf-8")
@@ -94,6 +101,7 @@ def main() -> int:
     parser.add_argument("--feed-poll-seconds", type=float, default=0.5, help="Shared feeder loop interval.")
     parser.add_argument("--feed-ws-timeout-seconds", type=float, default=5.0, help="Shared feeder WS timeout.")
     parser.add_argument("--output-dir", default=str(ROOT / "data" / "ab"), help="A/B output directory root.")
+    parser.add_argument("--maker-mode", action="store_true", help="Explicitly run both child strategies in maker mode.")
     args = parser.parse_args()
 
     day = str(args.date or "").strip() or _utc_day()
@@ -103,7 +111,10 @@ def main() -> int:
     out_root = Path(str(args.output_dir)).resolve() / run_id
     out_root.mkdir(parents=True, exist_ok=True)
     subprocess_env = _build_subprocess_env()
+    maker_mode = bool(args.maker_mode or _env_flag("SHADOW_IS_MAKER", default=False))
+    subprocess_env["SHADOW_IS_MAKER"] = ("1" if maker_mode else "0")
     print(f"[AB] PYTHONPATH={subprocess_env.get('PYTHONPATH', '')}")
+    print(f"[AB] execution_mode={'maker' if maker_mode else 'default'}")
 
     control_state = out_root / "control_state.json"
     control_ledger = out_root / "control_shadow_ledger.csv"
@@ -154,6 +165,8 @@ def main() -> int:
         common.append("--all-categories")
     if str(args.tickers or "").strip():
         common.extend(["--tickers", str(args.tickers).strip()])
+    if maker_mode:
+        common.extend(["--execution-mode", "maker"])
 
     control_cmd = [
         PYTHON,

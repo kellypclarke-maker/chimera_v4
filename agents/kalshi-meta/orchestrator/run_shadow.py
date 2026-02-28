@@ -3759,6 +3759,12 @@ def main() -> int:
     parser.add_argument("--summary-path", default="", help="Optional summary markdown output path.")
     parser.add_argument("--shared-feed-path", default="", help="Optional shared Kalshi market feed JSON path.")
     parser.add_argument("--shared-feed-max-age-seconds", type=float, default=2.0, help="Max shared feed age before considered stale.")
+    parser.add_argument(
+        "--execution-mode",
+        choices=("maker", "taker"),
+        default="",
+        help="Optional override for shadow execution mode. If omitted, existing config/default behavior is preserved.",
+    )
     parser.add_argument("--disable-hf-root-ledger", action="store_true", help="Disable repo-root HF eval ledger appends.")
     parser.add_argument("--hf-root-ledger-path", default="", help="Optional override for root HF eval ledger CSV path.")
     parser.add_argument(
@@ -3781,6 +3787,21 @@ def main() -> int:
 
     cfg = _load_config(Path(str(args.config)))
     _normalize_ev_thresholds_for_shadow_test(cfg)
+    execution_mode_override = str(args.execution_mode or "").strip().lower()
+    if not execution_mode_override:
+        env_exec_mode = str(os.environ.get("SHADOW_EXECUTION_MODE") or "").strip().lower()
+        if env_exec_mode in {"maker", "taker"}:
+            execution_mode_override = env_exec_mode
+        else:
+            env_is_maker = os.environ.get("SHADOW_IS_MAKER")
+            if env_is_maker is not None:
+                execution_mode_override = (
+                    "maker"
+                    if str(env_is_maker).strip().lower() in {"1", "true", "yes", "on"}
+                    else "taker"
+                )
+    if execution_mode_override in {"maker", "taker"}:
+        cfg["shadow_execution_mode"] = execution_mode_override
     print(
         f"[SHADOW][CONFIG] sports_oracle_provider="
         f"{str(cfg.get('sports_oracle_provider', 'odds_api') or 'odds_api').strip().lower()}"
