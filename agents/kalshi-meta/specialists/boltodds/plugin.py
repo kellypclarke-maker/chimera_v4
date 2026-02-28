@@ -509,14 +509,18 @@ def _update_partial_line(
         prev = _PARTIAL_LINES.get(cache_key, {})
         merged: Dict[str, object] = dict(prev)
         merged["league"] = str(league).strip().upper()
-        merged["home_code"] = str(home_code).strip().upper()
-        merged["away_code"] = str(away_code).strip().upper()
+        odds_by_team = dict(merged.get("odds_by_team") or {})
+        updated_by_team = dict(merged.get("updated_epoch_s_by_team") or {})
+        home_code_u = str(home_code).strip().upper()
+        away_code_u = str(away_code).strip().upper()
         if home_odds is not None:
-            merged["home_odds"] = float(home_odds)
-            merged["home_updated_epoch_s"] = float(leg_updated_epoch_s)
+            odds_by_team[home_code_u] = float(home_odds)
+            updated_by_team[home_code_u] = float(leg_updated_epoch_s)
         if away_odds is not None:
-            merged["away_odds"] = float(away_odds)
-            merged["away_updated_epoch_s"] = float(leg_updated_epoch_s)
+            odds_by_team[away_code_u] = float(away_odds)
+            updated_by_team[away_code_u] = float(leg_updated_epoch_s)
+        merged["odds_by_team"] = odds_by_team
+        merged["updated_epoch_s_by_team"] = updated_by_team
         if commence_time_utc:
             merged["commence_time_utc"] = str(commence_time_utc)
         merged["game_status"] = str(game_status or merged.get("game_status") or "unknown").strip().lower() or "unknown"
@@ -543,10 +547,16 @@ def _select_best_complete_line(
         merged = _PARTIAL_LINES.get(cache_key)
         if not isinstance(merged, dict):
             return None
-        home_odds = merged.get("home_odds")
-        away_odds = merged.get("away_odds")
-        home_updated = merged.get("home_updated_epoch_s")
-        away_updated = merged.get("away_updated_epoch_s")
+        odds_by_team = merged.get("odds_by_team")
+        updated_by_team = merged.get("updated_epoch_s_by_team")
+        if not isinstance(odds_by_team, Mapping) or not isinstance(updated_by_team, Mapping):
+            return None
+        home_code_u = str(home_code).strip().upper()
+        away_code_u = str(away_code).strip().upper()
+        home_odds = odds_by_team.get(home_code_u)
+        away_odds = odds_by_team.get(away_code_u)
+        home_updated = updated_by_team.get(home_code_u)
+        away_updated = updated_by_team.get(away_code_u)
         try:
             home_odds_f = float(home_odds)
             away_odds_f = float(away_odds)
@@ -558,8 +568,10 @@ def _select_best_complete_line(
             return None
         return {
             "sportsbook": sportsbook,
-            "home_odds": home_odds_f,
-            "away_odds": away_odds_f,
+            "team_odds": {
+                home_code_u: home_odds_f,
+                away_code_u: away_odds_f,
+            },
             "commence_time_utc": (str(merged.get("commence_time_utc") or "") or None),
             "game_status": str(merged.get("game_status") or "unknown").strip().lower() or "unknown",
             "source_ts_ms": int(merged.get("source_ts_ms") or 0),
@@ -771,8 +783,14 @@ def _parse_msg_to_matchup(
     )
     if not isinstance(selected_line, dict):
         return None
-    home_odds = float(selected_line["home_odds"])
-    away_odds = float(selected_line["away_odds"])
+    team_odds = selected_line.get("team_odds")
+    if not isinstance(team_odds, Mapping):
+        return None
+    try:
+        home_odds = float(team_odds[str(home_code).strip().upper()])
+        away_odds = float(team_odds[str(away_code).strip().upper()])
+    except Exception:
+        return None
     commence_iso = selected_line.get("commence_time_utc")
     game_status = str(selected_line.get("game_status") or "unknown").strip().lower() or "unknown"
     source_ts_ms = int(selected_line.get("source_ts_ms") or 0)
