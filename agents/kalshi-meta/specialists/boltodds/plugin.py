@@ -102,10 +102,10 @@ _NHL_TEAM_CODE_TO_NAME: Dict[str, str] = {
     "DET": "Detroit Red Wings",
     "EDM": "Edmonton Oilers",
     "FLA": "Florida Panthers",
-    "LAK": "Los Angeles Kings",
+    "LA": "Los Angeles Kings",
     "MIN": "Minnesota Wild",
     "MTL": "Montreal Canadiens",
-    "NJD": "New Jersey Devils",
+    "NJ": "New Jersey Devils",
     "NSH": "Nashville Predators",
     "NYI": "New York Islanders",
     "NYR": "New York Rangers",
@@ -113,9 +113,9 @@ _NHL_TEAM_CODE_TO_NAME: Dict[str, str] = {
     "PHI": "Philadelphia Flyers",
     "PIT": "Pittsburgh Penguins",
     "SEA": "Seattle Kraken",
-    "SJS": "San Jose Sharks",
+    "SJ": "San Jose Sharks",
     "STL": "St. Louis Blues",
-    "TBL": "Tampa Bay Lightning",
+    "TB": "Tampa Bay Lightning",
     "TOR": "Toronto Maple Leafs",
     "UTA": "Utah Hockey Club",
     "VAN": "Vancouver Canucks",
@@ -160,7 +160,7 @@ def _build_alias_map(code_to_name: Mapping[str, str]) -> Dict[str, str]:
         if len(set(codes)) == 1:
             out[nickname] = list(set(codes))[0]
     aliases = {
-        "new jersey": "NJD",
+        "new jersey": "NJ",
         "new york rangers": "NYR",
         "new york islanders": "NYI",
         "new york knicks": "NYK",
@@ -176,9 +176,9 @@ def _build_alias_map(code_to_name: Mapping[str, str]) -> Dict[str, str]:
         "philadelphia 76ers": "PHI",
         "philadelphia seventy sixers": "PHI",
         "76ers": "PHI",
-        "tampa bay": "TBL",
-        "los angeles kings": "LAK",
-        "san jose sharks": "SJS",
+        "tampa bay": "TB",
+        "los angeles kings": "LA",
+        "san jose sharks": "SJ",
         "st louis blues": "STL",
         "vegas golden knights": "VGK",
         "utah hockey club": "UTA",
@@ -193,7 +193,7 @@ def _build_alias_map(code_to_name: Mapping[str, str]) -> Dict[str, str]:
 _NBA_ALIASES = _build_alias_map(_NBA_TEAM_CODE_TO_NAME)
 _NHL_ALIASES = _build_alias_map(_NHL_TEAM_CODE_TO_NAME)
 _TEAM_NAME_MISS_LOGGED: set[tuple[str, str]] = set()
-_SPORTSBOOK_SOURCE_LOGGED: set[tuple[str, str]] = set()
+_SPORTSBOOK_SOURCE_LOGGED: set[tuple[str, str, str, int]] = set()
 _PARTIAL_LINES_LOCK = threading.Lock()
 _PARTIAL_LINES: Dict[Tuple[str, str, str], Dict[str, object]] = {}
 BOOKMAKER_HIERARCHY: Tuple[str, ...] = ("pinnacle", "draftkings", "polymarket")
@@ -479,13 +479,23 @@ def _hierarchy_for_allowed_books(allowed_books: set[str]) -> Tuple[str, ...]:
 
 
 def _log_book_source_once(*, league: str, matchup_key: str, sportsbook: str, fallback: bool) -> None:
-    key = (str(league or "").strip().upper(), str(matchup_key or "").strip().upper())
+    key = (
+        str(league or "").strip().upper(),
+        str(matchup_key or "").strip().upper(),
+        str(sportsbook or "").strip().lower(),
+        1 if fallback else 0,
+    )
     if not sportsbook or key in _SPORTSBOOK_SOURCE_LOGGED:
         return
     _SPORTSBOOK_SOURCE_LOGGED.add(key)
     if fallback:
         print(
             f"[SHADOW][ORACLE][DEBUG] BoltOdds fallback book selected league={league} "
+            f"matchup={matchup_key} sportsbook={sportsbook}"
+        )
+    else:
+        print(
+            f"[SHADOW][ORACLE][DEBUG] BoltOdds preferred book selected league={league} "
             f"matchup={matchup_key} sportsbook={sportsbook}"
         )
 
