@@ -1,9 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+
+
+_MIN_SAMPLE_WARNING = 20
+_DEFAULT_MIN_POINTS_PER_BIN = 5
+_MIN_EFFECTIVE_BINS = 3
 
 
 def _coerce_outcome(raw: Any) -> float:
@@ -44,6 +49,20 @@ def _prepare_binary_arrays(
     yp = np.asarray([_coerce_probability(v) for v in y_prob], dtype=float)
     mask = np.isfinite(yt) & np.isfinite(yp)
     return yt[mask], yp[mask]
+
+
+def _effective_bin_count(
+    sample_size: int,
+    requested_bins: int,
+    *,
+    min_points_per_bin: int = _DEFAULT_MIN_POINTS_PER_BIN,
+    min_bins: int = _MIN_EFFECTIVE_BINS,
+) -> int:
+    requested = max(2, int(requested_bins))
+    if sample_size <= 0:
+        return requested
+    max_supported = max(min_bins, sample_size // max(1, int(min_points_per_bin)))
+    return max(min_bins, min(requested, max_supported))
 
 
 def compute_brier_score(y_true: Sequence[Any], y_prob: Sequence[Any]) -> float:
@@ -137,6 +156,8 @@ def brier_full_report(
     p_true_col: str = "p_true",
     outcome_col: str = "outcome",
     n_bins: int = 10,
+    adaptive_bins: bool = True,
+    min_points_per_bin: int = _DEFAULT_MIN_POINTS_PER_BIN,
 ) -> Dict[str, Any]:
     if not isinstance(ledger_df, pd.DataFrame):
         raise TypeError("ledger_df must be a pandas DataFrame")
@@ -148,10 +169,40 @@ def brier_full_report(
     y_true = ledger_df[outcome_col].tolist()
     y_prob = ledger_df[p_true_col].tolist()
     yt, yp = _prepare_binary_arrays(y_true, y_prob)
+    sample_size = int(yt.size)
+    effective_bins = (
+        _effective_bin_count(
+            sample_size,
+            n_bins,
+            min_points_per_bin=min_points_per_bin,
+        )
+        if adaptive_bins
+        else max(2, int(n_bins))
+    )
+    warnings: List[str] = []
+    if sample_size < _MIN_SAMPLE_WARNING:
+        warnings.append(
+            f"Small sample size ({sample_size}); calibration metrics may be unstable."
+        )
+    bins = reliability_curve(yt, yp, n_bins=effective_bins)
+    occupied_bins = int(sum(1 for row in bins if float(row["count"]) > 0.0))
+    empty_bins = int(len(bins) - occupied_bins)
+    coverage_ratio = float(occupied_bins / len(bins)) if bins else float("nan")
+    if bins and coverage_ratio < 0.5:
+        warnings.append(
+            f"Sparse bin coverage ({occupied_bins}/{len(bins)} occupied); "
+            "ECE and reliability gaps may be noisy."
+        )
 
     return {
         "brier_score": compute_brier_score(yt, yp),
-        "ece": expected_calibration_error(yt, yp, n_bins=n_bins),
-        "sample_size": int(yt.size),
-        "reliability_bins": reliability_curve(yt, yp, n_bins=n_bins),
+        "ece": expected_calibration_error(yt, yp, n_bins=effective_bins),
+        "sample_size": sample_size,
+        "requested_n_bins": int(n_bins),
+        "effective_n_bins": effective_bins,
+        "occupied_bins": occupied_bins,
+        "empty_bins": empty_bins,
+        "coverage_ratio": coverage_ratio,
+        "warnings": warnings,
+        "reliability_bins": bins,
     }

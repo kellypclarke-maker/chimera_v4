@@ -3855,9 +3855,10 @@ def main() -> int:
 
     state = _read_json(state_path)
 
-    # If no state but a canonical ledger exists, bootstrap from it.
+    # If no state exists yet, bootstrap from the configured ledger path.
+    # This preserves A/B isolation instead of silently reloading the default
+    # root shadow ledger during a custom-profile run.
     if not state:
-        ledger_path = ROOT / "reports" / "shadow" / f"{day_key}_shadow_ledger.csv"
         ledger_rows = load_ledger(ledger_path)
         if ledger_rows:
             state = {
