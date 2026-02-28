@@ -14,6 +14,7 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import websockets
+from specialists.probabilities import binary_shin_devig_from_decimal_odds
 
 class ListenerState(str, Enum):
     BOOTING = "BOOTING"
@@ -192,10 +193,25 @@ def _build_alias_map(code_to_name: Mapping[str, str]) -> Dict[str, str]:
 _NBA_ALIASES = _build_alias_map(_NBA_TEAM_CODE_TO_NAME)
 _NHL_ALIASES = _build_alias_map(_NHL_TEAM_CODE_TO_NAME)
 _TEAM_NAME_MISS_LOGGED: set[tuple[str, str]] = set()
+_SPORTSBOOK_SOURCE_LOGGED: set[tuple[str, str]] = set()
 _PARTIAL_LINES_LOCK = threading.Lock()
 _PARTIAL_LINES: Dict[Tuple[str, str, str], Dict[str, object]] = {}
 BOOKMAKER_HIERARCHY: Tuple[str, ...] = ("pinnacle", "draftkings", "polymarket")
-MAX_STALE_LEG_SECONDS = 60.0
+MAX_STALE_LEG_SECONDS = 300.0
+MIN_BOLTODDS_STALE_SECONDS = 30.0
+
+_SPORTSBOOK_ALIASES: Dict[str, str] = {
+    "pinnacle": "pinnacle",
+    "pinnacle sports": "pinnacle",
+    "pinnaclesports": "pinnacle",
+    "draftkings": "draftkings",
+    "draft kings": "draftkings",
+    "dk": "draftkings",
+    "draftkings sportsbook": "draftkings",
+    "draft kings sportsbook": "draftkings",
+    "polymarket": "polymarket",
+    "poly market": "polymarket",
+}
 
 
 class AtomicOddsStore:
@@ -336,8 +352,16 @@ def _allowed_sportsbooks(config: Mapping[str, object]) -> set[str]:
         vals = [str(x).strip().lower() for x in str(raw).split(",") if str(x).strip()]
     elif isinstance(raw, Sequence) and not isinstance(raw, (bytes, bytearray)):
         vals = [str(x).strip().lower() for x in raw if str(x).strip()]
-    allowed = {v for v in vals if v and v not in {"*", "all", "any"}}
+    allowed = {_normalize_sportsbook_name(v) for v in vals if v and v not in {"*", "all", "any"}}
+    allowed.discard("")
     return allowed
+
+
+def _normalize_sportsbook_name(raw: object) -> str:
+    s = re.sub(r"[^a-z0-9]+", " ", str(raw or "").strip().lower()).strip()
+    if not s:
+        return ""
+    return _SPORTSBOOK_ALIASES.get(s, s.replace(" ", ""))
 
 
 def _subscription_payload(config: Mapping[str, object]) -> Dict[str, object]:
@@ -434,15 +458,7 @@ def _extract_decimal_odds(team_payload: Mapping[str, object]) -> Optional[float]
 
 
 def _calc_pair_probabilities(odds_a: float, odds_b: float) -> Optional[Tuple[float, float]]:
-    try:
-        ia = 1.0 / float(odds_a)
-        ib = 1.0 / float(odds_b)
-        total = ia + ib
-        if total <= 0.0:
-            return None
-        return (ia / total, ib / total)
-    except Exception:
-        return None
+    return binary_shin_devig_from_decimal_odds(float(odds_a), float(odds_b))
 
 
 def _log_name_miss_once(*, league: str, team_name: str) -> None:
@@ -460,6 +476,18 @@ def _hierarchy_for_allowed_books(allowed_books: set[str]) -> Tuple[str, ...]:
     if ranked:
         return tuple(ranked)
     return tuple(BOOKMAKER_HIERARCHY)
+
+
+def _log_book_source_once(*, league: str, matchup_key: str, sportsbook: str, fallback: bool) -> None:
+    key = (str(league or "").strip().upper(), str(matchup_key or "").strip().upper())
+    if not sportsbook or key in _SPORTSBOOK_SOURCE_LOGGED:
+        return
+    _SPORTSBOOK_SOURCE_LOGGED.add(key)
+    if fallback:
+        print(
+            f"[SHADOW][ORACLE][DEBUG] BoltOdds fallback book selected league={league} "
+            f"matchup={matchup_key} sportsbook={sportsbook}"
+        )
 
 
 def _update_partial_line(
@@ -503,37 +531,51 @@ def _select_best_complete_line(
     away_code: str,
     allowed_books: set[str],
     max_stale_leg_seconds: float,
+    allow_hierarchy_fallback: bool,
 ) -> Optional[Dict[str, object]]:
     lo, hi = sorted([str(home_code).strip().upper(), str(away_code).strip().upper()])
     pair_key = f"{lo}|{hi}"
-    hierarchy = _hierarchy_for_allowed_books(allowed_books)
+    preferred_hierarchy = _hierarchy_for_allowed_books(allowed_books)
+    fallback_hierarchy = tuple(book for book in BOOKMAKER_HIERARCHY if book not in preferred_hierarchy)
+
+    def _candidate_for_book(sportsbook: str) -> Optional[Dict[str, object]]:
+        cache_key = (str(league).strip().upper(), pair_key, str(sportsbook).strip().lower())
+        merged = _PARTIAL_LINES.get(cache_key)
+        if not isinstance(merged, dict):
+            return None
+        home_odds = merged.get("home_odds")
+        away_odds = merged.get("away_odds")
+        home_updated = merged.get("home_updated_epoch_s")
+        away_updated = merged.get("away_updated_epoch_s")
+        try:
+            home_odds_f = float(home_odds)
+            away_odds_f = float(away_odds)
+            home_updated_f = float(home_updated)
+            away_updated_f = float(away_updated)
+        except Exception:
+            return None
+        if abs(home_updated_f - away_updated_f) > max(1.0, float(max_stale_leg_seconds)):
+            return None
+        return {
+            "sportsbook": sportsbook,
+            "home_odds": home_odds_f,
+            "away_odds": away_odds_f,
+            "commence_time_utc": (str(merged.get("commence_time_utc") or "") or None),
+            "game_status": str(merged.get("game_status") or "unknown").strip().lower() or "unknown",
+            "source_ts_ms": int(merged.get("source_ts_ms") or 0),
+        }
+
     with _PARTIAL_LINES_LOCK:
-        for sportsbook in hierarchy:
-            cache_key = (str(league).strip().upper(), pair_key, str(sportsbook).strip().lower())
-            merged = _PARTIAL_LINES.get(cache_key)
-            if not isinstance(merged, dict):
-                continue
-            home_odds = merged.get("home_odds")
-            away_odds = merged.get("away_odds")
-            home_updated = merged.get("home_updated_epoch_s")
-            away_updated = merged.get("away_updated_epoch_s")
-            try:
-                home_odds_f = float(home_odds)
-                away_odds_f = float(away_odds)
-                home_updated_f = float(home_updated)
-                away_updated_f = float(away_updated)
-            except Exception:
-                continue
-            if abs(home_updated_f - away_updated_f) > max(1.0, float(max_stale_leg_seconds)):
-                continue
-            return {
-                "sportsbook": sportsbook,
-                "home_odds": home_odds_f,
-                "away_odds": away_odds_f,
-                "commence_time_utc": (str(merged.get("commence_time_utc") or "") or None),
-                "game_status": str(merged.get("game_status") or "unknown").strip().lower() or "unknown",
-                "source_ts_ms": int(merged.get("source_ts_ms") or 0),
-            }
+        for sportsbook in preferred_hierarchy:
+            candidate = _candidate_for_book(sportsbook)
+            if candidate is not None:
+                return candidate
+        if allow_hierarchy_fallback:
+            for sportsbook in fallback_hierarchy:
+                candidate = _candidate_for_book(sportsbook)
+                if candidate is not None:
+                    candidate["fallback_book"] = True
+                    return candidate
     return None
 
 
@@ -557,10 +599,8 @@ def _parse_msg_to_matchup(
     if not isinstance(data, Mapping):
         return None
 
-    sportsbook = str(data.get("sportsbook") or "").strip().lower()
+    sportsbook = _normalize_sportsbook_name(data.get("sportsbook"))
     allowed_books = _allowed_sportsbooks(config)
-    if allowed_books and sportsbook and sportsbook not in allowed_books:
-        return None
 
     league_raw = str(data.get("league") or data.get("sport") or "").strip().upper()
     if "NBA" in league_raw or league_raw == "BASKETBALL_NBA":
@@ -699,8 +739,16 @@ def _parse_msg_to_matchup(
 
     now_mono = time.monotonic()
     leg_updated_epoch_s = time.time()
-    stale_seconds = _float_cfg(config, "boltodds_stale_seconds", 5.0)
+    stale_seconds = max(
+        MIN_BOLTODDS_STALE_SECONDS,
+        _float_cfg(config, "boltodds_stale_seconds", MIN_BOLTODDS_STALE_SECONDS),
+    )
     max_stale_leg_seconds = _float_cfg(config, "boltodds_max_stale_leg_seconds", MAX_STALE_LEG_SECONDS)
+    allow_hierarchy_fallback = str(
+        config.get("boltodds_allow_hierarchy_fallback")
+        or os.environ.get("BOLTODDS_ALLOW_HIERARCHY_FALLBACK")
+        or "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}
     _update_partial_line(
         league=league,
         sportsbook=sportsbook,
@@ -719,6 +767,7 @@ def _parse_msg_to_matchup(
         away_code=away_code,
         allowed_books=allowed_books,
         max_stale_leg_seconds=max_stale_leg_seconds,
+        allow_hierarchy_fallback=allow_hierarchy_fallback,
     )
     if not isinstance(selected_line, dict):
         return None
@@ -727,6 +776,13 @@ def _parse_msg_to_matchup(
     commence_iso = selected_line.get("commence_time_utc")
     game_status = str(selected_line.get("game_status") or "unknown").strip().lower() or "unknown"
     source_ts_ms = int(selected_line.get("source_ts_ms") or 0)
+    lo, hi = sorted([home_code, away_code])
+    _log_book_source_once(
+        league=league,
+        matchup_key=f"{lo}|{hi}",
+        sportsbook=str(selected_line.get("sportsbook") or ""),
+        fallback=bool(selected_line.get("fallback_book")),
+    )
 
     probs = _calc_pair_probabilities(home_odds, away_odds)
     if probs is None:
@@ -738,7 +794,6 @@ def _parse_msg_to_matchup(
         str(away_code): float(p_away),
     }
 
-    lo, hi = sorted([home_code, away_code])
     matchup_key = f"{league}|{lo}|{hi}"
 
     return MatchupOdds(

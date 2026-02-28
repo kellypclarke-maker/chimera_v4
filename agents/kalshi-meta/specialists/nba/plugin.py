@@ -24,27 +24,83 @@ from specialists.helpers import (
     rules_pointer_from_row,
     safe_int,
 )
+from specialists.probabilities import binary_shin_devig_named_odds
 
 _P_TRUE_RE = re.compile(r"\bp_true(?:_cal)?=([0-9]*\.?[0-9]+)")
-_NBA_TEAMS = ("CHA", "IND", "MIA", "PHI", "MIN", "LAC")
+_NBA_TEAMS = (
+    "ATL", "BKN", "BOS", "CHA", "CHI", "CLE", "DAL", "DEN", "DET", "GSW",
+    "HOU", "IND", "LAC", "LAL", "MEM", "MIA", "MIL", "MIN", "NOP", "NYK",
+    "OKC", "ORL", "PHI", "PHX", "POR", "SAC", "SAS", "TOR", "UTA", "WAS",
+)
 _NBA_EVENT_RE = re.compile(r"^KXNBAGAME-(?P<date>\d{2}[A-Z]{3}\d{2})(?P<pair>[A-Z]{6})(?:-(?P<side>[A-Z]{3}))?$")
 
 _NBA_TEAM_CODE_TO_NAME: Dict[str, str] = {
+    "ATL": "Atlanta Hawks",
+    "BKN": "Brooklyn Nets",
+    "BOS": "Boston Celtics",
     "CHA": "Charlotte Hornets",
+    "CHI": "Chicago Bulls",
+    "CLE": "Cleveland Cavaliers",
+    "DAL": "Dallas Mavericks",
+    "DEN": "Denver Nuggets",
+    "DET": "Detroit Pistons",
+    "GSW": "Golden State Warriors",
+    "HOU": "Houston Rockets",
     "IND": "Indiana Pacers",
+    "LAL": "Los Angeles Lakers",
+    "MEM": "Memphis Grizzlies",
     "MIA": "Miami Heat",
+    "MIL": "Milwaukee Bucks",
+    "NOP": "New Orleans Pelicans",
+    "NYK": "New York Knicks",
+    "OKC": "Oklahoma City Thunder",
+    "ORL": "Orlando Magic",
     "PHI": "Philadelphia 76ers",
+    "PHX": "Phoenix Suns",
+    "POR": "Portland Trail Blazers",
+    "SAC": "Sacramento Kings",
+    "SAS": "San Antonio Spurs",
+    "TOR": "Toronto Raptors",
+    "UTA": "Utah Jazz",
+    "WAS": "Washington Wizards",
     "MIN": "Minnesota Timberwolves",
     "LAC": "Los Angeles Clippers",
 }
 
 _NBA_TEAM_ALIASES: Dict[str, str] = {
+    "atlanta hawks": "Atlanta Hawks",
+    "brooklyn nets": "Brooklyn Nets",
+    "boston celtics": "Boston Celtics",
     "charlotte hornets": "Charlotte Hornets",
+    "chicago bulls": "Chicago Bulls",
+    "cleveland cavaliers": "Cleveland Cavaliers",
+    "dallas mavericks": "Dallas Mavericks",
+    "denver nuggets": "Denver Nuggets",
+    "detroit pistons": "Detroit Pistons",
+    "golden state warriors": "Golden State Warriors",
+    "houston rockets": "Houston Rockets",
     "indiana pacers": "Indiana Pacers",
+    "los angeles lakers": "Los Angeles Lakers",
+    "la lakers": "Los Angeles Lakers",
+    "l a lakers": "Los Angeles Lakers",
+    "memphis grizzlies": "Memphis Grizzlies",
     "miami heat": "Miami Heat",
+    "milwaukee bucks": "Milwaukee Bucks",
+    "new orleans pelicans": "New Orleans Pelicans",
+    "new york knicks": "New York Knicks",
+    "oklahoma city thunder": "Oklahoma City Thunder",
+    "orlando magic": "Orlando Magic",
     "philadelphia 76ers": "Philadelphia 76ers",
     "philadelphia seventy sixers": "Philadelphia 76ers",
     "76ers": "Philadelphia 76ers",
+    "phoenix suns": "Phoenix Suns",
+    "portland trail blazers": "Portland Trail Blazers",
+    "portland trailblazers": "Portland Trail Blazers",
+    "sacramento kings": "Sacramento Kings",
+    "san antonio spurs": "San Antonio Spurs",
+    "toronto raptors": "Toronto Raptors",
+    "utah jazz": "Utah Jazz",
+    "washington wizards": "Washington Wizards",
     "minnesota timberwolves": "Minnesota Timberwolves",
     "los angeles clippers": "Los Angeles Clippers",
     "la clippers": "Los Angeles Clippers",
@@ -153,7 +209,7 @@ def _extract_bookmaker_h2h_probs(bookmaker: Dict[str, object]) -> Optional[Dict[
         outcomes = market.get("outcomes")
         if not isinstance(outcomes, list):
             continue
-        implied: Dict[str, float] = {}
+        odds_by_team: Dict[str, float] = {}
         for outcome in outcomes:
             if not isinstance(outcome, dict):
                 continue
@@ -166,13 +222,11 @@ def _extract_bookmaker_h2h_probs(bookmaker: Dict[str, object]) -> Optional[Dict[
                 continue
             if price <= 1.0:
                 continue
-            implied[team_name] = 1.0 / price
-        if len(implied) < 2:
+            odds_by_team[team_name] = float(price)
+        probs = binary_shin_devig_named_odds(odds_by_team)
+        if not probs:
             continue
-        total = sum(float(v) for v in implied.values())
-        if total <= 0.0:
-            continue
-        return {k: float(v) / total for k, v in implied.items()}
+        return {k: float(v) for k, v in probs.items()}
     return None
 
 

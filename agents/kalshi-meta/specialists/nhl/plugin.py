@@ -24,6 +24,7 @@ from specialists.helpers import (
     rules_pointer_from_row,
     safe_int,
 )
+from specialists.probabilities import binary_shin_devig_named_odds
 
 _P_TRUE_RE = re.compile(r"\bp_true(?:_cal)?=([0-9]*\.?[0-9]+)")
 _NHL_EVENT_RE = re.compile(r"^KXNHLGAME-(?P<date>\d{2}[A-Z]{3}\d{2})(?P<pair>[A-Z]{6})(?:-(?P<side>[A-Z]{3}))?$")
@@ -185,7 +186,7 @@ def _extract_bookmaker_h2h_probs(bookmaker: Dict[str, object]) -> Optional[Dict[
         outcomes = market.get("outcomes")
         if not isinstance(outcomes, list):
             continue
-        implied: Dict[str, float] = {}
+        odds_by_team: Dict[str, float] = {}
         for outcome in outcomes:
             if not isinstance(outcome, dict):
                 continue
@@ -198,13 +199,11 @@ def _extract_bookmaker_h2h_probs(bookmaker: Dict[str, object]) -> Optional[Dict[
                 continue
             if price <= 1.0:
                 continue
-            implied[team_name] = 1.0 / price
-        if len(implied) < 2:
+            odds_by_team[team_name] = float(price)
+        probs = binary_shin_devig_named_odds(odds_by_team)
+        if not probs:
             continue
-        total = sum(float(v) for v in implied.values())
-        if total <= 0.0:
-            continue
-        return {k: float(v) / total for k, v in implied.items()}
+        return {k: float(v) for k, v in probs.items()}
     return None
 
 
